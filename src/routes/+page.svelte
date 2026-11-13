@@ -1,6 +1,8 @@
 <script>
   import { open } from "@tauri-apps/plugin-dialog";
   import { call } from "$lib/api";
+  import { branchMenuItems, menuPosition } from "$lib/branchMenu.js";
+  import { settingsNav, settingsSectionOr } from "$lib/settingsNav.js";
   import Graph from "$lib/Graph.svelte";
   import Merge from "$lib/Merge.svelte";
 
@@ -35,7 +37,11 @@
   let prBase = $state("main");
   let modal = $state(null);
   let dragMenu = $state(null);
+  let branchMenu = $state(null);
   let steps = $state([]);
+  let openSections = $state({ ramas: true, worktrees: true, stash: true, prs: true });
+  let settingsSection = $state("perfiles");
+  let closedFolders = $state({});
   const services = [
     { label: "GitHub", host: "github.com" },
     { label: "GitLab", host: "gitlab.com" },
@@ -113,6 +119,7 @@
         prs = [];
         commits = [];
         dragMenu = null;
+        branchMenu = null;
         message = drafts[info.path] || "";
         passphrase = phrases[info.path] || "";
       }
@@ -216,6 +223,63 @@
     modal = { text, action };
   }
 
+  function setPassphrase(value) {
+    passphrase = value;
+    if (!info?.path) return;
+    phrases = { ...phrases, [info.path]: value };
+  }
+
+  function openBranchMenu(event, branch) {
+    event.preventDefault();
+    const current = branch === (info?.branch || "");
+    const place = menuPosition(event.clientX, event.clientY, 248, current ? 188 : 188, {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
+    branchMenu = { branch, current, ...place };
+  }
+
+  async function copyBranchName(name) {
+    await navigator.clipboard.writeText(name);
+    notice = "Nombre copiado.";
+  }
+
+  $effect(() => {
+    if (!branchMenu) return;
+    const close = (event) => {
+      if (event.key === "Escape") branchMenu = null;
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  });
+
+  function runBranchAction(id) {
+    const menu = branchMenu;
+    if (!menu) return;
+    const branch = menu.branch;
+    branchMenu = null;
+    if (id === "copy") {
+      fail(() => copyBranchName(branch));
+    } else if (id === "switch") {
+      fail(async () => {
+        await call("switch_branch", { name: branch });
+        await loadRepo();
+      });
+    } else if (id === "merge") {
+      ask(`Merge de ${branch} en ${info.branch}.`, async () => {
+        await call("merge", { branch });
+        await loadRepo();
+      });
+    } else if (id === "rebase") {
+      ask(`Rebase de ${info.branch} sobre ${branch}. Reescribe los commits de la rama actual.`, async () => {
+        await call("rebase_branch", { upstream: branch });
+        await loadRepo();
+      });
+    } else if (id === "fetch" || id === "pull" || id === "push") {
+      fail(() => call("network", { action: id, passphrase: passphrase || null }).then(loadRepo));
+    }
+  }
+
   async function dropOn(branch, data) {
     if (data.startsWith("branch:")) {
       const source = data.slice(7);
@@ -273,6 +337,68 @@
     notice = "Perfil guardado.";
   }
 
+  function toggleSection(id) {
+    openSections = { ...openSections, [id]: !openSections[id] };
+  }
+
+  function toggleFolder(path) {
+    closedFolders = { ...closedFolders, [path]: !closedFolders[path] };
+  }
+
+  function branchTree(names) {
+    const root = { children: [], leaves: [] };
+    const index = new Map();
+    for (const name of [...names].sort((a, b) => a.localeCompare(b))) {
+      const parts = name.split("/").filter(Boolean);
+      if (parts.length <= 1) {
+        root.leaves.push(name);
+        continue;
+      }
+      let parent = root;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const path = parts.slice(0, i + 1).join("/");
+        let child = index.get(path);
+        if (!child) {
+          child = { name: parts[i], path, children: [], leaves: [] };
+          index.set(path, child);
+          parent.children.push(child);
+        }
+        parent = child;
+      }
+      parent.leaves.push(name);
+    }
+    return root;
+  }
+
+  function leafCount(node) {
+    return node.leaves.length + node.children.reduce((sum, child) => sum + leafCount(child), 0);
+  }
+
+  function branchRows(names, closed) {
+    const rows = [];
+    function walk(node, depth) {
+      for (const child of node.children) {
+        const shut = closed[child.path] === true;
+        rows.push({
+          kind: "folder",
+          path: child.path,
+          name: child.name,
+          depth,
+          shut,
+          count: leafCount(child),
+        });
+        if (!shut) walk(child, depth + 1);
+      }
+      for (const branch of node.leaves) {
+        rows.push({ kind: "leaf", branch, depth, label: branch.includes("/") ? branch.split("/").pop() : branch });
+      }
+    }
+    walk(branchTree(names), 0);
+    return rows;
+  }
+
+  let branchList = $derived(branchRows(branches, closedFolders));
+
   async function saveResult(text) {
     await fail(async () => {
       await call("write_result", { path: conflict.path, text });
@@ -291,20 +417,62 @@
   </svg>
 {/snippet}
 
-<div class="app">
+{#snippet icon(name)}
+  <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+    {#if name === "branch"}
+      <circle cx="4" cy="3" r="1.3" /><circle cx="4" cy="13" r="1.3" /><circle cx="11" cy="13" r="1.3" />
+      <path d="M4 4.3v7.4M4 5.2h4.2a2.4 2.4 0 0 1 2.4 2.4V11.7" />
+    {:else if name === "fetch"}
+      <path d="M13 8.2a5 5 0 1 1-1.4-3.4" /><path d="M13.2 2.6v3.2H10" />
+    {:else if name === "pull"}
+      <path d="M8 2.4v8.2M5.2 7.6 8 10.6l2.8-3M3.2 13.6h9.6" />
+    {:else if name === "push"}
+      <path d="M8 13.6V5.4M5.2 8.2 8 5.2l2.8 3M3.2 2.4h9.6" />
+    {:else if name === "sliders"}
+      <path d="M2.4 4h11.2M2.4 8h11.2M2.4 12h11.2" /><circle cx="6" cy="4" r="1.3" /><circle cx="10.5" cy="8" r="1.3" /><circle cx="7" cy="12" r="1.3" />
+    {:else if name === "key"}
+      <path d="M8.1 5.4a2.3 2.3 0 1 0 4.6 0 2.3 2.3 0 0 0-4.6 0M8.6 6.8 3.2 12.2V14h2.1v-1.5H7V11l1.6-1.6" />
+    {:else if name === "worktree"}
+      <rect x="2.2" y="2.6" width="7.2" height="7.2" rx="1.2" /><rect x="6.6" y="6.2" width="7.2" height="7.2" rx="1.2" />
+    {:else if name === "stash"}
+      <path d="M3 6.4h10v6.8H3zM3 6.4 8 3.2l5 3.2M8 3.2v10" />
+    {:else if name === "pr"}
+      <circle cx="4" cy="3.4" r="1.3" /><circle cx="4" cy="12.6" r="1.3" /><circle cx="12" cy="12.6" r="1.3" />
+      <path d="M4 4.7v6.6M12 12.6V6.8A2.2 2.2 0 0 0 9.8 4.6H6.4" /><path d="M8.2 2.8 6.2 4.6l2 1.8" />
+    {:else if name === "copy"}
+      <rect x="5.2" y="5.2" width="7.4" height="7.4" rx="1.2" /><path d="M10.6 5.2V3.8A1.2 1.2 0 0 0 9.4 2.6H3.8A1.2 1.2 0 0 0 2.6 3.8v5.6A1.2 1.2 0 0 0 3.8 10.6H5.2" />
+    {:else if name === "switch"}
+      <path d="M4 3.2h6.2M8.2 1.4 10.2 3.2 8.2 5M12 12.8H5.8M7.8 11 5.8 12.8l2 1.8" />
+    {:else if name === "merge"}
+      <circle cx="4" cy="3.2" r="1.2" /><circle cx="12" cy="3.2" r="1.2" /><circle cx="8" cy="12.8" r="1.2" />
+      <path d="M4 4.4v2.2a3 3 0 0 0 3 3h1M12 4.4v2.2a3 3 0 0 1-3 3H8v2" />
+    {:else if name === "rebase"}
+      <path d="M3.2 12.8h9.6M8 10.6V3.4M5.4 6 8 3.4 10.6 6" />
+    {:else if name === "profile"}
+      <circle cx="8" cy="5" r="2.1" /><path d="M3.4 13.4c.7-2.5 2.4-3.8 4.6-3.8s3.9 1.3 4.6 3.8" />
+    {:else if name === "token"}
+      <rect x="2.2" y="3.8" width="11.6" height="8.4" rx="1.4" /><path d="M2.2 7h11.6M5 10h2.6" />
+    {/if}
+  </svg>
+{/snippet}
+
+<div class="app" class:repo={screen === "repo"}>
   <header class="top">
     <button class="brand" onclick={() => (screen = "home")}>{@render mango(28)} StashMango</button>
     {#if screen === "repo" && info}
       <div class="dock">
-        <span class="chip">{info.branch || "HEAD"}</span>
-        <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>Fetch</button>
-        <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>Pull</button>
-        <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>Push</button>
-        <input class="secret" placeholder="Frase SSH" bind:value={passphrase} type="password" />
+        <span class="chip" title={info.branch || "HEAD"}>
+          <span class="chip-kicker">{@render icon("branch")} Rama</span>
+          <span class="chip-name">{info.branch || "HEAD"}</span>
+        </span>
+        <span class="dock-rule" aria-hidden="true"></span>
+        <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")} Fetch</button>
+        <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")} Pull</button>
+        <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")} Push</button>
       </div>
     {/if}
     <span class="spacer"></span>
-    <button class="ghost" onclick={openSettings}>Configuración</button>
+    <button class="ghost" onclick={openSettings}>{@render icon("sliders")} Configuración</button>
   </header>
   {#if tabs.length}
     <div class="tabs">
@@ -363,117 +531,181 @@
       </div>
     </section>
   {:else if screen === "settings"}
-    <section class="home settings">
-      <header class="settings-head">
-        <p class="kicker">Firmas y acceso</p>
-        <h1>Configuración</h1>
-      </header>
-      <article class="plate">
-        <div class="plate-head">
-          <h2>Perfiles</h2>
-          <p>El perfil default ya existe. El nombre, el correo y los tokens de cada servicio se guardan en este perfil.</p>
-        </div>
-        {#if profiles.profiles.length}
-          <ul class="people">
-            {#each profiles.profiles as item}
-              <li class:active={item.id === profileForm.id}>
-                <button class="branch" onclick={() => fail(() => editProfile(item))}>
-                  <strong>{item.label}</strong>
-                  <span class="muted">{item.name ? `${item.name} <${item.email}>` : "Sin firma todavía"}</span>
-                </button>
-                {#if item.id !== "default"}
-                  <button class="danger" onclick={() => fail(async () => { profiles = await call("delete_profile", { id: item.id }); if (profileForm.id === item.id) await editProfile(profiles.profiles.find((profile) => profile.id === "default")); })}>Borrar</button>
-                {/if}
-              </li>
-            {/each}
-          </ul>
-        {/if}
-        <div class="fields">
-          <label>Etiqueta <input bind:value={profileForm.label} /></label>
-          <label>Nombre <input bind:value={profileForm.name} /></label>
-          <label>Correo <input bind:value={profileForm.email} /></label>
-        </div>
-        <div class="services">
-          <h3>Servicios</h3>
-          {#each services as service}
-            <div class="service">
-              <div>
-                <strong>{service.label}</strong>
-                <span class="muted">{serviceSaved[service.host] ? "Token guardado" : "Sin token"}</span>
-              </div>
-              <input type="password" placeholder="Pegar token" bind:value={serviceTokens[service.host]} autocomplete="off" />
-              {#if serviceSaved[service.host]}
-                <button class="danger" onclick={() => fail(async () => { await call("clear_token", { profileId: profileForm.id, host: service.host }); serviceSaved = { ...serviceSaved, [service.host]: false }; })}>Quitar</button>
-              {/if}
+    <section class="settings-screen">
+      <aside class="settings-nav">
+        <p class="kicker">Configuración</p>
+        {#each settingsNav as item (item.id)}
+          <button type="button" class="nav-item" class:current={settingsSection === item.id} onclick={() => (settingsSection = settingsSectionOr(item.id))}>
+            {@render icon(item.icon)}
+            {item.label}
+          </button>
+        {/each}
+      </aside>
+      <div class="settings-pane">
+        {#if settingsSection === "perfiles"}
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("profile")} Perfiles</h2>
+              <p>El perfil default ya existe. Aquí van el nombre y el correo. No se puede borrar.</p>
             </div>
-          {/each}
-        </div>
-        <div class="plate-foot spread">
-          <button onclick={startProfile}>Otro perfil</button>
-          <button class="primary" onclick={() => fail(saveCurrent)}>Guardar</button>
-        </div>
-      </article>
-      <article class="plate">
-        <div class="plate-head">
-          <h2>Git portable</h2>
-          <p>Apagado de inicio. Solo agrega la carpeta de StashMango al final del PATH de tu usuario.</p>
-        </div>
-        <div class="plate-foot split">
-          <button onclick={() => fail(() => call("set_external_git", { enabled: true }))}>Usar este Git fuera de StashMango</button>
-          <button onclick={() => fail(() => call("set_external_git", { enabled: false }))}>Quitarlo del PATH</button>
-        </div>
-      </article>
+            {#if profiles.profiles.length}
+              <ul class="people">
+                {#each profiles.profiles as item}
+                  <li class:active={item.id === profileForm.id}>
+                    <button class="branch" onclick={() => fail(() => editProfile(item))}>
+                      <strong>{item.label}</strong>
+                      <span class="muted">{item.name ? `${item.name} <${item.email}>` : "Sin firma todavía"}</span>
+                    </button>
+                    {#if item.id !== "default"}
+                      <button class="danger" onclick={() => fail(async () => { profiles = await call("delete_profile", { id: item.id }); if (profileForm.id === item.id) await editProfile(profiles.profiles.find((profile) => profile.id === "default")); })}>Borrar</button>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+            <div class="fields">
+              <label>Etiqueta <input bind:value={profileForm.label} /></label>
+              <label>Nombre <input bind:value={profileForm.name} /></label>
+              <label>Correo <input bind:value={profileForm.email} /></label>
+            </div>
+            <div class="plate-foot spread">
+              <button onclick={startProfile}>Otro perfil</button>
+              <button class="primary" onclick={() => fail(saveCurrent)}>Guardar</button>
+            </div>
+          </article>
+        {:else if settingsSection === "servicios"}
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("token")} Servicios</h2>
+              <p>Tokens de {profileForm.label || "este perfil"}. El campo vacío deja el token que ya está en el llavero.</p>
+            </div>
+            <div class="services">
+              {#each services as service}
+                <div class="service">
+                  <div>
+                    <strong>{service.label}</strong>
+                    <span class="muted">{serviceSaved[service.host] ? "Token guardado" : "Sin token"}</span>
+                  </div>
+                  <input type="password" placeholder="Pegar token" bind:value={serviceTokens[service.host]} autocomplete="off" />
+                  {#if serviceSaved[service.host]}
+                    <button class="danger" onclick={() => fail(async () => { await call("clear_token", { profileId: profileForm.id, host: service.host }); serviceSaved = { ...serviceSaved, [service.host]: false }; })}>Quitar</button>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+            <div class="plate-foot">
+              <button class="primary" onclick={() => fail(saveCurrent)}>Guardar</button>
+            </div>
+          </article>
+        {:else if settingsSection === "ssh"}
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("key")} Frase SSH</h2>
+              <p>Es de este repo y solo vive mientras la app está abierta. No se escribe en el disco ni en el perfil.</p>
+            </div>
+            {#if info}
+              <div class="fields">
+                <label>
+                  {repoName(info.path)}
+                  <input class="phrase" type="password" autocomplete="new-password" spellcheck="false" placeholder="Frase de la clave" value={passphrase} oninput={(event) => setPassphrase(event.currentTarget.value)} />
+                </label>
+              </div>
+            {:else}
+              <div class="fields">
+                <p class="muted">Abre un repo. Cada uno guarda la suya.</p>
+              </div>
+            {/if}
+          </article>
+        {:else if settingsSection === "git"}
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("branch")} Git</h2>
+              <p>Apagado de inicio. Solo agrega la carpeta de StashMango al final del PATH de tu usuario.</p>
+            </div>
+            <div class="plate-foot split">
+              <button onclick={() => fail(() => call("set_external_git", { enabled: true }))}>Usar este Git fuera de StashMango</button>
+              <button onclick={() => fail(() => call("set_external_git", { enabled: false }))}>Quitarlo del PATH</button>
+            </div>
+          </article>
+        {/if}
+      </div>
     </section>
   {:else if info}
     <div class="work">
       <aside class="side">
+        {#snippet fold(id, title, glyph)}
+          <button class="fold-head" onclick={() => toggleSection(id)} aria-expanded={openSections[id]}>
+            <span class="caret">{openSections[id] ? "▾" : "▸"}</span>
+            {@render icon(glyph)}
+            {title}
+          </button>
+        {/snippet}
         <div class="section">
-          <h2>Ramas</h2>
-          {#each branches as branch}
-            <button
-              class="branch"
-              class:current={branch === info.branch}
-              draggable="true"
-              ondragstart={(event) => event.dataTransfer?.setData("text/plain", `branch:${branch}`)}
-              ondragover={(event) => event.preventDefault()}
-              ondrop={(event) => { event.preventDefault(); dropOn(branch, event.dataTransfer?.getData("text/plain") || ""); }}
-              onclick={() => fail(async () => { await call("switch_branch", { name: branch }); await loadRepo(); })}
-            >{branch}</button>
-          {/each}
-          <div class="rowish">
-            <input placeholder="nueva rama" bind:value={newBranch} />
-            <button onclick={() => fail(async () => { await call("create_branch", { name: newBranch }); newBranch = ""; await loadRepo(); })}>Crear</button>
-          </div>
+          {@render fold("ramas", "Ramas", "branch")}
+          {#if openSections.ramas}
+            {#each branchList as row (row.kind + (row.path || row.branch))}
+              {#if row.kind === "folder"}
+                <button type="button" class="folder" class:shut={row.shut} style:padding-left={`${8 + row.depth * 12}px`} onclick={() => toggleFolder(row.path)}>
+                  <span class="caret">{row.shut ? "▸" : "▾"}</span>
+                  <span>{row.name}</span>
+                  <span class="muted">{row.count}</span>
+                </button>
+              {:else}
+                <button
+                  type="button"
+                  class="branch"
+                  class:current={row.branch === info.branch}
+                  style:padding-left={`${8 + row.depth * 12}px`}
+                  draggable="true"
+                  ondragstart={(event) => event.dataTransfer?.setData("text/plain", `branch:${row.branch}`)}
+                  ondragover={(event) => event.preventDefault()}
+                  ondrop={(event) => { event.preventDefault(); dropOn(row.branch, event.dataTransfer?.getData("text/plain") || ""); }}
+                  onclick={() => fail(async () => { await call("switch_branch", { name: row.branch }); await loadRepo(); })}
+                  oncontextmenu={(event) => openBranchMenu(event, row.branch)}
+                ><span>{row.label}</span></button>
+              {/if}
+            {/each}
+            <div class="rowish">
+              <input placeholder="nueva rama" bind:value={newBranch} />
+              <button onclick={() => fail(async () => { await call("create_branch", { name: newBranch }); newBranch = ""; await loadRepo(); })}>Crear</button>
+            </div>
+          {/if}
         </div>
         <div class="section">
-          <h2>Worktrees</h2>
-          {#each worktrees as tree}
-            <button class="branch" onclick={() => choose(tree.path)}>{tree.branch || tree.head.slice(0, 7)}<small class="muted">{tree.path}</small></button>
-            {#if tree.path !== info.path}
-              <button class="danger" onclick={() => ask(`Quitar el worktree ${tree.path}. Si hay cambios, git se niega.`, async () => { await call("remove_worktree", { path: tree.path, confirm: true }); await loadRepo(); })}>Quitar</button>
-            {/if}
-          {/each}
-          <button onclick={async () => { const path = await open({ directory: true }); if (path && newBranch) await fail(async () => { await call("add_worktree", { path, branch: newBranch }); await loadRepo(); }); }}>Añadir en carpeta</button>
+          {@render fold("worktrees", "Worktrees", "worktree")}
+          {#if openSections.worktrees}
+            {#each worktrees as tree}
+              <button class="branch" onclick={() => choose(tree.path)}><span>{tree.branch || tree.head.slice(0, 7)}</span><small class="muted">{tree.path}</small></button>
+              {#if tree.path !== info.path}
+                <button class="danger" onclick={() => ask(`Quitar el worktree ${tree.path}. Si hay cambios, git se niega.`, async () => { await call("remove_worktree", { path: tree.path, confirm: true }); await loadRepo(); })}>Quitar</button>
+              {/if}
+            {/each}
+            <button onclick={async () => { const path = await open({ directory: true }); if (path && newBranch) await fail(async () => { await call("add_worktree", { path, branch: newBranch }); await loadRepo(); }); }}>Añadir en carpeta</button>
+          {/if}
         </div>
         <div class="section">
-          <h2>Stash</h2>
-          {#each stashes as stash}<p class="mono">{stash}</p>{/each}
-          <button onclick={() => fail(async () => { await call("stash_push", { message: message || "stash" }); await loadRepo(); })}>Guardar</button>
-          <button onclick={() => fail(async () => { await call("stash_pop"); await loadRepo(); })}>Pop</button>
-          <button class="danger" onclick={() => ask("Soltar el stash más reciente.", async () => { await call("stash_drop", { confirm: true }); await loadRepo(); })}>Drop</button>
+          {@render fold("stash", "Stash", "stash")}
+          {#if openSections.stash}
+            {#each stashes as stash}<p class="mono">{stash}</p>{/each}
+            <button onclick={() => fail(async () => { await call("stash_push", { message: message || "stash" }); await loadRepo(); })}>Guardar</button>
+            <button onclick={() => fail(async () => { await call("stash_pop"); await loadRepo(); })}>Pop</button>
+            <button class="danger" onclick={() => ask("Soltar el stash más reciente.", async () => { await call("stash_drop", { confirm: true }); await loadRepo(); })}>Drop</button>
+          {/if}
         </div>
         <div class="section">
-          <h2>Pull requests</h2>
-          <button onclick={() => fail(async () => { prs = await call("list_prs"); })}>Actualizar</button>
-          {#each prs as pr}
-            <p>{pr.title}<span class="muted"> {pr.head} → {pr.base} · {pr.author}</span></p>
-            <button onclick={() => fail(async () => { diff = { path: pr.title, text: await call("pr_diff", { number: pr.number }), too_big: false, binary: false, cached: false, hunks: 0 }; })}>Diff</button>
-            <button onclick={() => fail(() => call("merge_pr", { number: pr.number }))}>Merge</button>
-          {/each}
-          <input placeholder="título" bind:value={prTitle} />
-          <input placeholder="head" bind:value={prHead} />
-          <input placeholder="base" bind:value={prBase} />
-          <button onclick={() => fail(() => call("create_pr", { title: prTitle, head: prHead, base: prBase }))}>Crear PR</button>
+          {@render fold("prs", "Pull requests", "pr")}
+          {#if openSections.prs}
+            <button onclick={() => fail(async () => { prs = await call("list_prs"); })}>Actualizar</button>
+            {#each prs as pr}
+              <p>{pr.title}<span class="muted"> {pr.head} → {pr.base} · {pr.author}</span></p>
+              <button onclick={() => fail(async () => { diff = { path: pr.title, text: await call("pr_diff", { number: pr.number }), too_big: false, binary: false, cached: false, hunks: 0 }; })}>Diff</button>
+              <button onclick={() => fail(() => call("merge_pr", { number: pr.number }))}>Merge</button>
+            {/each}
+            <input placeholder="título" bind:value={prTitle} />
+            <input placeholder="head" bind:value={prHead} />
+            <input placeholder="base" bind:value={prBase} />
+            <button onclick={() => fail(() => call("create_pr", { title: prTitle, head: prHead, base: prBase }))}>Crear PR</button>
+          {/if}
         </div>
       </aside>
 
@@ -563,6 +795,32 @@
           </div>
         {/if}
       </aside>
+    </div>
+  {/if}
+
+  {#if branchMenu}
+    <div
+      class="context-back"
+      role="presentation"
+      onclick={() => (branchMenu = null)}
+      oncontextmenu={(event) => { event.preventDefault(); branchMenu = null; }}
+      onkeydown={(event) => { if (event.key === "Escape") branchMenu = null; }}
+    >
+      <div
+        class="context"
+        role="menu"
+        tabindex="-1"
+        style:left={`${branchMenu.x}px`}
+        style:top={`${branchMenu.y}px`}
+        onclick={(event) => event.stopPropagation()}
+        onkeydown={(event) => { if (event.key === "Escape") branchMenu = null; }}
+      >
+        <p class="kicker">{branchMenu.current ? "Rama actual" : "Otra rama"}</p>
+        <p class="context-name">{branchMenu.branch}</p>
+        {#each branchMenuItems(branchMenu.current) as item (item.id)}
+          <button type="button" role="menuitem" onclick={() => runBranchAction(item.id)}>{@render icon(item.icon)} {item.label}</button>
+        {/each}
+      </div>
     </div>
   {/if}
 
