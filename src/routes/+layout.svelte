@@ -7,4 +7,6 @@
   let { children } = $props();
 </script>
 
+<svelte:window oncontextmenu={(event) => event.preventDefault()} />
+
 {@render children()}

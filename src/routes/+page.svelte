@@ -1,8 +1,19 @@
 <script>
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
   import { call } from "$lib/api";
+  import { captionToggleTarget } from "$lib/caption.js";
+  import { nextSide, sideNav } from "$lib/sideNav.js";
   import { branchMenuItems, menuPosition } from "$lib/branchMenu.js";
+  import { branchRows, localBranchNames } from "$lib/branchList.js";
+  import { clampColumn, graphColumnChoices, layoutPayload, normalizeColumns, toggleGraphColumn } from "$lib/columns.js";
+  import { defaultTemplates, fillTemplate, insertToken, normalizeTemplates, sampleVars, templateKinds, templateTokens, templateVars, wrapToken } from "$lib/commitTemplates.js";
   import { settingsNav, settingsSectionOr } from "$lib/settingsNav.js";
+  import { diffHunks, lineKind, stageableIndex } from "$lib/diffHunks.js";
+  import { canStagePreview, previewImageSrc, previewKicker } from "$lib/previewFile.js";
+  import { fileFolder, fileName, groupWorkFiles } from "$lib/workFiles.js";
+  import { placeRepoTab } from "$lib/repoTabs.js";
+  import { sameWorktreePath, worktreeFolder, worktreeLabel } from "$lib/worktreeCard.js";
   import Graph from "$lib/Graph.svelte";
   import Merge from "$lib/Merge.svelte";
 
@@ -18,7 +29,7 @@
   let commits = $state([]);
   let openLanes = $state([]);
   let done = $state(false);
-  let branches = $state([]);
+  let branchRefs = $state([]);
   let worktrees = $state([]);
   let stashes = $state([]);
   let prs = $state([]);
@@ -39,8 +50,12 @@
   let dragMenu = $state(null);
   let branchMenu = $state(null);
   let steps = $state([]);
-  let openSections = $state({ ramas: true, worktrees: true, stash: true, prs: true });
+  let sideView = $state("ramas");
+  let columns = $state(normalizeColumns());
   let settingsSection = $state("perfiles");
+  let templates = $state(normalizeTemplates());
+  let templateKind = $state("merge");
+  let templateBox;
   let closedFolders = $state({});
   const services = [
     { label: "GitHub", host: "github.com" },
@@ -54,6 +69,8 @@
   async function boot() {
     try {
       recents = await call("recents");
+      columns = normalizeColumns(await call("layout"));
+      templates = normalizeTemplates(await call("templates"));
     } catch (err) {
       const text = String(err);
       if (!text.includes("invoke")) error = text;
@@ -73,7 +90,7 @@
 
   async function loadRepo() {
     info = await call("refresh");
-    branches = await call("branches");
+    branchRefs = await call("branches");
     worktrees = await call("worktrees");
     stashes = await call("stash_list");
     profile = await call("active_profile");
@@ -93,9 +110,7 @@
 
   function touchTab() {
     if (!info) return;
-    const tab = { path: info.path, name: repoName(info.path), branch: info.branch };
-    const index = tabs.findIndex((item) => item.path === info.path);
-    tabs = index >= 0 ? tabs.map((item, i) => (i === index ? tab : item)) : [...tabs, tab];
+    tabs = placeRepoTab(tabs, info, worktrees);
     activePath = info.path;
   }
 
@@ -120,7 +135,7 @@
         commits = [];
         dragMenu = null;
         branchMenu = null;
-        message = drafts[info.path] || "";
+        message = drafts[info.path] || fillTemplate(templates.commit, workVars()) || "";
         passphrase = phrases[info.path] || "";
       }
       await loadRepo();
@@ -177,32 +192,19 @@
     files = await call("commit_files", { sha: commit.id });
   }
 
-  async function showDiff(path, cached) {
-    selected = null;
+  async function showPreview(path, options = {}) {
+    const cached = Boolean(options.cached);
+    const sha = options.sha || "";
     conflict = null;
-    diff = await call("diff_file", { path, cached });
-    diff.cached = cached;
-  }
-
-  function changedLines(text) {
-    const hunks = [];
-    let current = null;
-    for (const line of (text || "").split("\n")) {
-      if (line.startsWith("@@")) {
-        current = { header: line, lines: [] };
-        hunks.push(current);
-      } else if (current && (line.startsWith("+") || line.startsWith("-"))) {
-        current.lines.push(line);
-      }
-    }
-    return hunks;
+    if (!sha) selected = null;
+    diff = await call("diff_file", { path, cached, sha: sha || null });
   }
 
   async function stageHunk(index) {
     await fail(async () => {
       await call("apply_selection", { path: diff.path, cached: diff.cached, hunks: [index], lines: [] });
       await loadRepo();
-      await showDiff(diff.path, diff.cached);
+      await showPreview(diff.path, { cached: diff.cached, sha: diff.sha });
     });
   }
 
@@ -215,12 +217,53 @@
         lines: [{ hunk, line }],
       });
       await loadRepo();
-      await showDiff(diff.path, false);
+      await showPreview(diff.path, { cached: diff.cached, sha: diff.sha });
     });
+  }
+
+  async function stageDiffLine(hunk, line) {
+    const pick = stageableIndex(diffHunks(diff.text)[hunk]?.lines || [], line);
+    if (pick < 0) return;
+    await stageLine(hunk, pick);
   }
 
   function ask(text, action) {
     modal = { text, action };
+  }
+
+  function workVars(extra = {}) {
+    return templateVars({
+      current: extra.current || info?.branch || "HEAD",
+      branch: extra.branch || extra.current || info?.branch || "",
+      files: extra.files || info?.files || [],
+      sha: extra.sha || selected?.id || "",
+      summary: extra.summary || selected?.summary || "",
+    });
+  }
+
+  function mergeMessage(incoming) {
+    return fillTemplate(templates.merge, workVars({ branch: incoming || "esta rama" }));
+  }
+
+  async function runMerge(incoming) {
+    const filled = mergeMessage(incoming);
+    await call("merge", { branch: incoming, message: filled });
+    await loadRepo();
+    const hasConflict = (info?.files || []).some((file) => file.conflict);
+    message = hasConflict ? filled : fillTemplate(templates.commit, workVars()) || "";
+  }
+
+  function putToken(id) {
+    const key = templateKind;
+    const current = templates[key] || "";
+    const start = templateBox?.selectionStart ?? current.length;
+    const end = templateBox?.selectionEnd ?? start;
+    const next = insertToken(current, id, start, end);
+    templates = { ...templates, [key]: next.text };
+    queueMicrotask(() => {
+      templateBox?.focus();
+      templateBox?.setSelectionRange(next.cursor, next.cursor);
+    });
   }
 
   function setPassphrase(value) {
@@ -229,14 +272,14 @@
     phrases = { ...phrases, [info.path]: value };
   }
 
-  function openBranchMenu(event, branch) {
+  function openBranchMenu(event, branch, remote = false) {
     event.preventDefault();
     const current = branch === (info?.branch || "");
-    const place = menuPosition(event.clientX, event.clientY, 248, current ? 188 : 188, {
+    const place = menuPosition(event.clientX, event.clientY, 280, current ? 188 : 248, {
       width: window.innerWidth,
       height: window.innerHeight,
     });
-    branchMenu = { branch, current, ...place };
+    branchMenu = { branch, current, remote, ...place };
   }
 
   async function copyBranchName(name) {
@@ -266,12 +309,10 @@
         await loadRepo();
       });
     } else if (id === "merge") {
-      ask(`Merge de ${branch} en ${info.branch}.`, async () => {
-        await call("merge", { branch });
-        await loadRepo();
-      });
+      ask(`Merge de ${branch} en ${info.branch}.`, () => runMerge(branch));
     } else if (id === "rebase") {
-      ask(`Rebase de ${info.branch} sobre ${branch}. Reescribe los commits de la rama actual.`, async () => {
+      const text = fillTemplate(templates.rebase, workVars({ branch })) || `Rebase de ${info.branch} sobre ${branch}. Reescribe los commits de la rama actual.`;
+      ask(text, async () => {
         await call("rebase_branch", { upstream: branch });
         await loadRepo();
       });
@@ -286,9 +327,11 @@
       dragMenu = { source, branch };
     } else if (data.startsWith("commit:")) {
       const sha = data.slice(7);
-      ask(`Cherry-pick de ${sha.slice(0, 7)} en ${branch}.`, async () => {
+      const picked = commits.find((commit) => commit.id === sha);
+      const filled = fillTemplate(templates.cherry, workVars({ current: branch, sha, summary: picked?.summary || "" }));
+      ask(filled || `Cherry-pick de ${sha.slice(0, 7)} en ${branch}.`, async () => {
         await call("switch_branch", { name: branch });
-        await call("cherry_pick", { sha });
+        await call("cherry_pick", { sha, message: filled });
         await loadRepo();
       });
     }
@@ -337,67 +380,105 @@
     notice = "Perfil guardado.";
   }
 
-  function toggleSection(id) {
-    openSections = { ...openSections, [id]: !openSections[id] };
+  function saveColumns() {
+    fail(() => call("save_layout", { layout: layoutPayload(columns) }));
+  }
+
+  function setGraphColumn(id) {
+    columns = { ...columns, graphColumns: toggleGraphColumn(columns.graphColumns, id) };
+    saveColumns();
+  }
+
+  function setColumn(name, open) {
+    columns = { ...columns, [name]: open };
+    saveColumns();
+  }
+
+  function dragColumn(event, key) {
+    const startX = event.clientX;
+    const start = columns[key];
+    const sign = key === "detailWidth" ? -1 : 1;
+    const handle = event.currentTarget;
+    handle.setPointerCapture?.(event.pointerId);
+    const move = (ev) => {
+      columns = { ...columns, [key]: clampColumn(key, start + sign * (ev.clientX - startX)) };
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      saveColumns();
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+  }
+
+  function pickSide(id) {
+    const next = nextSide(columns.side, sideView, id);
+    sideView = next.view;
+    if (next.open !== columns.side) setColumn("side", next.open);
   }
 
   function toggleFolder(path) {
     closedFolders = { ...closedFolders, [path]: !closedFolders[path] };
   }
 
-  function branchTree(names) {
-    const root = { children: [], leaves: [] };
-    const index = new Map();
-    for (const name of [...names].sort((a, b) => a.localeCompare(b))) {
-      const parts = name.split("/").filter(Boolean);
-      if (parts.length <= 1) {
-        root.leaves.push(name);
-        continue;
-      }
-      let parent = root;
-      for (let i = 0; i < parts.length - 1; i++) {
-        const path = parts.slice(0, i + 1).join("/");
-        let child = index.get(path);
-        if (!child) {
-          child = { name: parts[i], path, children: [], leaves: [] };
-          index.set(path, child);
-          parent.children.push(child);
-        }
-        parent = child;
-      }
-      parent.leaves.push(name);
+  let branches = $derived(localBranchNames(branchRefs));
+  let branchList = $derived(branchRows(branchRefs, closedFolders));
+
+  let maximized = $state(false);
+
+  function frameWindow() {
+    try {
+      return getCurrentWindow();
+    } catch {
+      return null;
     }
-    return root;
   }
 
-  function leafCount(node) {
-    return node.leaves.length + node.children.reduce((sum, child) => sum + leafCount(child), 0);
+  function syncFrame() {
+    const win = frameWindow();
+    if (!win) return;
+    win.isMaximized().then((value) => {
+      maximized = value;
+    }).catch(() => {});
   }
 
-  function branchRows(names, closed) {
-    const rows = [];
-    function walk(node, depth) {
-      for (const child of node.children) {
-        const shut = closed[child.path] === true;
-        rows.push({
-          kind: "folder",
-          path: child.path,
-          name: child.name,
-          depth,
-          shut,
-          count: leafCount(child),
-        });
-        if (!shut) walk(child, depth + 1);
-      }
-      for (const branch of node.leaves) {
-        rows.push({ kind: "leaf", branch, depth, label: branch.includes("/") ? branch.split("/").pop() : branch });
-      }
-    }
-    walk(branchTree(names), 0);
-    return rows;
+  $effect(() => {
+    const win = frameWindow();
+    if (!win) return;
+    let alive = true;
+    let unlisten = () => {};
+    syncFrame();
+    win.onResized(() => {
+      if (alive) syncFrame();
+    }).then((stop) => {
+      if (alive) unlisten = stop;
+      else stop();
+    }).catch(() => {});
+    return () => {
+      alive = false;
+      unlisten();
+    };
+  });
+
+  function minimizeWindow() {
+    frameWindow()?.minimize().catch(() => {});
   }
 
-  let branchList = $derived(branchRows(branches, closedFolders));
+  function toggleWindow() {
+    const win = frameWindow();
+    if (!win) return;
+    win.toggleMaximize().then(syncFrame).catch(() => {});
+  }
+
+  function closeWindow() {
+    frameWindow()?.close().catch(() => {});
+  }
+
+  function toggleFromCaption(event) {
+    if (!captionToggleTarget(event.target)) return;
+    toggleWindow();
+  }
 
   async function saveResult(text) {
     await fail(async () => {
@@ -452,42 +533,199 @@
       <circle cx="8" cy="5" r="2.1" /><path d="M3.4 13.4c.7-2.5 2.4-3.8 4.6-3.8s3.9 1.3 4.6 3.8" />
     {:else if name === "token"}
       <rect x="2.2" y="3.8" width="11.6" height="8.4" rx="1.4" /><path d="M2.2 7h11.6M5 10h2.6" />
+    {:else if name === "template"}
+      <rect x="3.4" y="2.4" width="9.2" height="11.2" rx="1.2" />
+      <path d="M5.4 5.6h5.2M5.4 8h5.2M5.4 10.4h3.2" />
+    {:else if name === "maximize"}
+      <rect x="3.2" y="3.2" width="9.6" height="9.6" rx="1.2" />
+    {:else if name === "restore"}
+      <rect x="5.2" y="2.8" width="8" height="8" rx="1" />
+      <path d="M2.8 5.2V13h7.8" />
+    {:else if name === "close"}
+      <path d="M4 4l8 8M12 4l-8 8" />
+    {:else if name === "plus"}
+      <path d="M8 3.2v9.6M3.2 8h9.6" />
+    {:else if name === "minus"}
+      <path d="M3.2 8h9.6" />
+    {:else if name === "check"}
+      <path d="M3.2 8.4 6.4 11.6 12.8 4.4" />
+    {:else if name === "remote"}
+      <path d="M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z" />
+      <path d="M2.6 8h10.8M8 2.8c1.6 1.6 2.4 3.3 2.4 5.2s-.8 3.6-2.4 5.2c-1.6-1.6-2.4-3.3-2.4-5.2s.8-3.6 2.4-5.2" />
     {/if}
   </svg>
 {/snippet}
 
-<div class="app" class:repo={screen === "repo"}>
-  <header class="top">
-    <button class="brand" onclick={() => (screen = "home")}>{@render mango(28)} StashMango</button>
+<div class="app" class:repo={screen === "repo"} class:side-shut={screen === "repo" && !columns.side} style:--side="{columns.sideWidth}px">
+  <div class="shell">
     {#if screen === "repo" && info}
-      <div class="dock">
-        <span class="chip" title={info.branch || "HEAD"}>
-          <span class="chip-kicker">{@render icon("branch")} Rama</span>
-          <span class="chip-name">{info.branch || "HEAD"}</span>
-        </span>
-        <span class="dock-rule" aria-hidden="true"></span>
-        <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")} Fetch</button>
-        <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")} Pull</button>
-        <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")} Push</button>
+    <aside class="side" class:shut={!columns.side}>
+      <button class="brand" title="StashMango" onclick={() => (screen = "home")}>{@render mango(28)} <span>StashMango</span></button>
+      <div class="side-body">
+      <nav class="side-nav" aria-label="Paneles del repo">
+        {#each sideNav as item (item.id)}
+          <button
+            type="button"
+            class:on={columns.side && sideView === item.id}
+            aria-pressed={columns.side && sideView === item.id}
+            aria-label={item.label}
+            title={item.label}
+            onclick={() => pickSide(item.id)}
+          >{@render icon(item.icon)}</button>
+        {/each}
+      </nav>
+      {#if columns.side}
+      <div class="side-pane">
+      <button type="button" class="splitter" aria-label="Ancho del panel" onpointerdown={(event) => dragColumn(event, "sideWidth")}></button>
+      {#if sideView === "ramas"}
+      <div class="section">
+        <p class="kicker">Ramas</p>
+          {#each branchList as row (row.kind + (row.path || row.branch))}
+            {#if row.kind === "folder"}
+              <button type="button" class="folder" class:shut={row.shut} style:padding-left={`${8 + row.depth * 12}px`} onclick={() => toggleFolder(row.path)}>
+                <span class="caret">{row.shut ? "▸" : "▾"}</span>
+                <span>{row.name}</span>
+                <span class="muted">{row.count}</span>
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="branch"
+                class:current={row.branch === info.branch}
+                style:padding-left={`${8 + row.depth * 12}px`}
+                draggable="true"
+                ondragstart={(event) => event.dataTransfer?.setData("text/plain", `branch:${row.branch}`)}
+                ondragover={(event) => event.preventDefault()}
+                ondrop={(event) => { event.preventDefault(); dropOn(row.branch, event.dataTransfer?.getData("text/plain") || ""); }}
+                onclick={() => { if (row.remote) return; fail(async () => { await call("switch_branch", { name: row.branch }); await loadRepo(); }); }}
+                oncontextmenu={(event) => openBranchMenu(event, row.branch, row.remote)}
+                title={row.synced ? `Igual que origin/${row.branch}` : row.remote ? row.branch : undefined}
+              >
+                <span class="name">{row.label}</span>
+                {#if row.synced}
+                  <span class="sync">{@render icon("remote")}</span>
+                {/if}
+              </button>
+            {/if}
+          {/each}
+          <div class="rowish">
+            <input placeholder="nueva rama" bind:value={newBranch} />
+            <button onclick={() => fail(async () => { await call("create_branch", { name: newBranch }); newBranch = ""; await loadRepo(); })}>Crear</button>
+          </div>
       </div>
+      {:else if sideView === "worktrees"}
+      <div class="section">
+        <p class="kicker">Worktrees</p>
+          <div class="trees">
+            {#each worktrees as tree (tree.path)}
+              {@const here = sameWorktreePath(tree.path, info.path)}
+              <div class="tree" class:here>
+                <button
+                  type="button"
+                  class="tree-open"
+                  title={tree.path}
+                  aria-current={here ? "page" : undefined}
+                  onclick={() => { if (!here) choose(tree.path); }}
+                >
+                  <span class="tree-branch">{worktreeLabel(tree) || "HEAD"}</span>
+                  <span class="tree-folder">{worktreeFolder(tree.path)}</span>
+                </button>
+                {#if here}
+                  <span class="here-mark" title="Estás aquí">{@render icon("check")}</span>
+                {:else}
+                  <button
+                    type="button"
+                    class="tree-drop"
+                    title="Quitar worktree"
+                    aria-label="Quitar worktree {worktreeFolder(tree.path)}"
+                    onclick={() => ask(`Quitar el worktree ${tree.path}. Si hay cambios, git se niega.`, async () => { await call("remove_worktree", { path: tree.path, confirm: true }); await loadRepo(); })}
+                  >{@render icon("close")}</button>
+                {/if}
+              </div>
+            {/each}
+            <div class="tree-foot">
+              <input placeholder="rama" bind:value={newBranch} aria-label="Rama del worktree" />
+              <button
+                type="button"
+                class="tree-add"
+                disabled={!newBranch.trim()}
+                title={newBranch.trim() ? "Elegir carpeta" : "Escribe la rama primero"}
+                onclick={async () => {
+                  const path = await open({ directory: true });
+                  if (path && newBranch.trim()) await fail(async () => { await call("add_worktree", { path, branch: newBranch.trim() }); await loadRepo(); });
+                }}
+              >{@render icon("plus")} Carpeta</button>
+            </div>
+          </div>
+      </div>
+      {:else if sideView === "stash"}
+      <div class="section">
+        <p class="kicker">Stash</p>
+          {#each stashes as stash}<p class="mono">{stash}</p>{/each}
+          <button onclick={() => fail(async () => { const filled = (fillTemplate(templates.stash, workVars({ summary: message })) || message || "stash").replace(/\s+/g, " ").trim(); await call("stash_push", { message: filled }); await loadRepo(); })}>Guardar</button>
+          <button onclick={() => fail(async () => { await call("stash_pop"); await loadRepo(); })}>Pop</button>
+          <button class="danger" onclick={() => ask("Soltar el stash más reciente.", async () => { await call("stash_drop", { confirm: true }); await loadRepo(); })}>Drop</button>
+      </div>
+      {:else if sideView === "prs"}
+      <div class="section">
+        <p class="kicker">Pull requests</p>
+          <button onclick={() => fail(async () => { prs = await call("list_prs"); })}>Actualizar</button>
+          {#each prs as pr}
+            <p>{pr.title}<span class="muted"> {pr.head} → {pr.base} · {pr.author}</span></p>
+            <button onclick={() => fail(async () => { diff = { path: pr.title, text: await call("pr_diff", { number: pr.number }), too_big: false, binary: false, cached: false, hunks: 0 }; })}>Diff</button>
+            <button onclick={() => fail(() => call("merge_pr", { number: pr.number }))}>Merge</button>
+          {/each}
+          <input placeholder="título" bind:value={prTitle} />
+          <input placeholder="head" bind:value={prHead} />
+          <input placeholder="base" bind:value={prBase} />
+          <button onclick={() => fail(() => { const title = prTitle.trim() || fillTemplate(templates.pr, workVars({ branch: prHead, summary: message || selected?.summary || "" })); return call("create_pr", { title, head: prHead, base: prBase }); })}>Crear PR</button>
+      </div>
+      {/if}
+      </div>
+      {/if}
+      </div>
+    </aside>
     {/if}
-    <span class="spacer"></span>
-    <button class="ghost" onclick={openSettings}>{@render icon("sliders")} Configuración</button>
-  </header>
-  {#if tabs.length}
-    <div class="tabs">
-      {#each tabs as tab (tab.path)}
-        <div class="tab" class:active={tab.path === activePath && screen === "repo"}>
-          <button class="tab-main" onclick={() => focusTab(tab.path)}>
-            <span>{tab.name}</span>
-            <small>{tab.branch || "HEAD"}</small>
-          </button>
-          <button class="x" aria-label="Cerrar {tab.name}" onclick={() => closeTab(tab.path)}>×</button>
+    <div class="stage">
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <header class="top" data-tauri-drag-region ondblclick={toggleFromCaption}>
+        {#if !(screen === "repo" && info)}
+          <button class="brand" onclick={() => (screen = "home")}>{@render mango(28)} StashMango</button>
+        {/if}
+        {#if tabs.length}
+          <div class="tabs">
+            {#each tabs as tab (tab.id)}
+              <div class="tab" class:active={tab.path === activePath && screen === "repo"}>
+                <button class="tab-main" onclick={() => focusTab(tab.path)}>
+                  <span>{tab.name}</span>
+                  <small>{tab.branch || "HEAD"}</small>
+                </button>
+                <button class="x" aria-label="Cerrar {tab.name}" onclick={() => closeTab(tab.path)}>×</button>
+              </div>
+            {/each}
+            <button class="tab-add" onclick={browse}>+</button>
+          </div>
+        {/if}
+        {#if screen === "repo" && info}
+          <div class="dock">
+            <span class="chip" title={info.branch || "HEAD"}>
+              <span class="chip-kicker">{@render icon("branch")} Rama</span>
+              <span class="chip-name">{info.branch || "HEAD"}</span>
+            </span>
+            <span class="dock-rule" aria-hidden="true"></span>
+            <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")} Fetch</button>
+            <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")} Pull</button>
+            <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")} Push</button>
+          </div>
+        {/if}
+        <span class="spacer" data-tauri-drag-region></span>
+        <button class="ghost" onclick={openSettings}>{@render icon("sliders")} Configuración</button>
+        <div class="win-controls">
+          <button type="button" aria-label="Minimizar" onclick={minimizeWindow}>{@render icon("minus")}</button>
+          <button type="button" aria-label={maximized ? "Restaurar" : "Maximizar"} onclick={toggleWindow}>{@render icon(maximized ? "restore" : "maximize")}</button>
+          <button type="button" class="close" aria-label="Cerrar" onclick={closeWindow}>{@render icon("close")}</button>
         </div>
-      {/each}
-      <button class="tab-add" onclick={browse}>+</button>
-    </div>
-  {/if}
+      </header>
 
   {#if error}<p class="banner error">{error}</p>{/if}
   {#if notice}<p class="banner ok">{notice}</p>{/if}
@@ -616,6 +854,67 @@
               </div>
             {/if}
           </article>
+        {:else if settingsSection === "plantillas"}
+          {@const kind = templateKinds.find((item) => item.id === templateKind) || templateKinds[0]}
+          {@const preview = fillTemplate(templates[kind.id], sampleVars(info, info?.files)) || "Git escribe el mensaje solo."}
+          <article class="plate templates-plate">
+            <div class="plate-head">
+              <h2>{@render icon("template")} Plantillas</h2>
+              <p>Un tipo a la vez. Pulsa un hueco para insertarlo. El ejemplo usa tu rama actual si hay un repo abierto.</p>
+            </div>
+            <div class="tpl-shell">
+              <div class="tpl-rail" role="tablist" aria-label="Tipos de plantilla">
+                {#each templateKinds as item (item.id)}
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={templateKind === item.id}
+                    class="tpl-item"
+                    class:current={templateKind === item.id}
+                    onclick={() => (templateKind = item.id)}
+                  >
+                    {@render icon(item.icon)}
+                    <span>
+                      <strong>{item.label}</strong>
+                      <small>{item.hint}</small>
+                    </span>
+                  </button>
+                {/each}
+              </div>
+              <div class="tpl-editor">
+                <div class="tpl-head">
+                  <p class="kicker">{kind.label}</p>
+                  <p class="muted">{kind.hint}</p>
+                </div>
+                <textarea
+                  rows="5"
+                  bind:this={templateBox}
+                  bind:value={templates[kind.id]}
+                  placeholder={defaultTemplates[kind.id] || "Vacío: no se usa plantilla"}
+                  spellcheck="false"
+                ></textarea>
+                <div class="tpl-chips">
+                  {#each templateTokens as token (token.id)}
+                    <button
+                      type="button"
+                      class="tpl-chip"
+                      class:on={(templates[kind.id] || "").includes(wrapToken(token.id))}
+                      title={token.label}
+                      onclick={() => putToken(token.id)}
+                    >{wrapToken(token.id)}</button>
+                  {/each}
+                </div>
+                <div class="tpl-preview">
+                  <p class="kicker">Así queda</p>
+                  <p>{preview}</p>
+                </div>
+              </div>
+            </div>
+            <div class="plate-foot spread">
+              <button type="button" onclick={() => (templates = { ...templates, [kind.id]: defaultTemplates[kind.id] })}>Restablecer esta</button>
+              <button class="primary" onclick={() => fail(async () => { templates = normalizeTemplates(await call("save_templates", { templates })); notice = "Plantillas guardadas."; })}>Guardar</button>
+            </div>
+          </article>
         {:else if settingsSection === "git"}
           <article class="plate">
             <div class="plate-head">
@@ -627,150 +926,209 @@
               <button onclick={() => fail(() => call("set_external_git", { enabled: false }))}>Quitarlo del PATH</button>
             </div>
           </article>
+        {:else if settingsSection === "columnas"}
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("sliders")} Columnas</h2>
+              <p>Marca las que quieres ver en el grafo. Siempre queda al menos una.</p>
+            </div>
+            <div class="column-picks">
+              {#each graphColumnChoices as item (item.id)}
+                <label class="column-pick">
+                  <input
+                    type="checkbox"
+                    checked={columns.graphColumns.includes(item.id)}
+                    onchange={() => setGraphColumn(item.id)}
+                  />
+                  <strong>{item.label}</strong>
+                  <small>{item.hint}</small>
+                </label>
+              {/each}
+            </div>
+          </article>
         {/if}
       </div>
     </section>
   {:else if info}
-    <div class="work">
-      <aside class="side">
-        {#snippet fold(id, title, glyph)}
-          <button class="fold-head" onclick={() => toggleSection(id)} aria-expanded={openSections[id]}>
-            <span class="caret">{openSections[id] ? "▾" : "▸"}</span>
-            {@render icon(glyph)}
-            {title}
-          </button>
-        {/snippet}
-        <div class="section">
-          {@render fold("ramas", "Ramas", "branch")}
-          {#if openSections.ramas}
-            {#each branchList as row (row.kind + (row.path || row.branch))}
-              {#if row.kind === "folder"}
-                <button type="button" class="folder" class:shut={row.shut} style:padding-left={`${8 + row.depth * 12}px`} onclick={() => toggleFolder(row.path)}>
-                  <span class="caret">{row.shut ? "▸" : "▾"}</span>
-                  <span>{row.name}</span>
-                  <span class="muted">{row.count}</span>
-                </button>
-              {:else}
-                <button
-                  type="button"
-                  class="branch"
-                  class:current={row.branch === info.branch}
-                  style:padding-left={`${8 + row.depth * 12}px`}
-                  draggable="true"
-                  ondragstart={(event) => event.dataTransfer?.setData("text/plain", `branch:${row.branch}`)}
-                  ondragover={(event) => event.preventDefault()}
-                  ondrop={(event) => { event.preventDefault(); dropOn(row.branch, event.dataTransfer?.getData("text/plain") || ""); }}
-                  onclick={() => fail(async () => { await call("switch_branch", { name: row.branch }); await loadRepo(); })}
-                  oncontextmenu={(event) => openBranchMenu(event, row.branch)}
-                ><span>{row.label}</span></button>
-              {/if}
-            {/each}
-            <div class="rowish">
-              <input placeholder="nueva rama" bind:value={newBranch} />
-              <button onclick={() => fail(async () => { await call("create_branch", { name: newBranch }); newBranch = ""; await loadRepo(); })}>Crear</button>
+    <div class="work" class:detail-shut={!columns.detail} style:--detail="{columns.detailWidth}px">
+      <main class="graph-wrap" class:stage-open={Boolean((conflict && !conflict.too_big) || diff)} onscroll={onScroll}>
+        {#if conflict && !conflict.too_big}
+          <div class="merge-stage">
+            <div class="merge-head">
+              <p class="kicker">Conflicto</p>
+              <h2 title={conflict.path}>{fileName(conflict.path) || conflict.path}</h2>
+              <span class="muted">{fileFolder(conflict.path)}</span>
+              <button type="button" class="ghost" onclick={() => (conflict = null)}>Volver al grafo</button>
             </div>
-          {/if}
-        </div>
-        <div class="section">
-          {@render fold("worktrees", "Worktrees", "worktree")}
-          {#if openSections.worktrees}
-            {#each worktrees as tree}
-              <button class="branch" onclick={() => choose(tree.path)}><span>{tree.branch || tree.head.slice(0, 7)}</span><small class="muted">{tree.path}</small></button>
-              {#if tree.path !== info.path}
-                <button class="danger" onclick={() => ask(`Quitar el worktree ${tree.path}. Si hay cambios, git se niega.`, async () => { await call("remove_worktree", { path: tree.path, confirm: true }); await loadRepo(); })}>Quitar</button>
-              {/if}
-            {/each}
-            <button onclick={async () => { const path = await open({ directory: true }); if (path && newBranch) await fail(async () => { await call("add_worktree", { path, branch: newBranch }); await loadRepo(); }); }}>Añadir en carpeta</button>
-          {/if}
-        </div>
-        <div class="section">
-          {@render fold("stash", "Stash", "stash")}
-          {#if openSections.stash}
-            {#each stashes as stash}<p class="mono">{stash}</p>{/each}
-            <button onclick={() => fail(async () => { await call("stash_push", { message: message || "stash" }); await loadRepo(); })}>Guardar</button>
-            <button onclick={() => fail(async () => { await call("stash_pop"); await loadRepo(); })}>Pop</button>
-            <button class="danger" onclick={() => ask("Soltar el stash más reciente.", async () => { await call("stash_drop", { confirm: true }); await loadRepo(); })}>Drop</button>
-          {/if}
-        </div>
-        <div class="section">
-          {@render fold("prs", "Pull requests", "pr")}
-          {#if openSections.prs}
-            <button onclick={() => fail(async () => { prs = await call("list_prs"); })}>Actualizar</button>
-            {#each prs as pr}
-              <p>{pr.title}<span class="muted"> {pr.head} → {pr.base} · {pr.author}</span></p>
-              <button onclick={() => fail(async () => { diff = { path: pr.title, text: await call("pr_diff", { number: pr.number }), too_big: false, binary: false, cached: false, hunks: 0 }; })}>Diff</button>
-              <button onclick={() => fail(() => call("merge_pr", { number: pr.number }))}>Merge</button>
-            {/each}
-            <input placeholder="título" bind:value={prTitle} />
-            <input placeholder="head" bind:value={prHead} />
-            <input placeholder="base" bind:value={prBase} />
-            <button onclick={() => fail(() => call("create_pr", { title: prTitle, head: prHead, base: prBase }))}>Crear PR</button>
-          {/if}
-        </div>
-      </aside>
-
-      <main class="graph-wrap" onscroll={onScroll}>
-        <Graph {commits} selected={selected?.id || ""} onselect={pickCommit} />
-        {#if !done}<button onclick={more}>Más historial</button>{/if}
+            <Merge
+              path={conflict.path}
+              ours={conflict.ours}
+              theirs={conflict.theirs}
+              bind:result={conflict.result}
+              onsave={saveResult}
+              onours={() => ask("Quedarme con el nuestro pisa el archivo.", async () => { await call("resolve_side", { path: conflict.path, ours: true, confirm: true }); conflict = null; await loadRepo(); })}
+              ontheirs={() => ask("Quedarme con el suyo pisa el archivo.", async () => { await call("resolve_side", { path: conflict.path, ours: false, confirm: true }); conflict = null; await loadRepo(); })}
+            />
+          </div>
+        {:else if diff}
+          {@const hunks = diffHunks(diff.text)}
+          {@const imageSrc = previewImageSrc(diff)}
+          {@const staging = canStagePreview(diff)}
+          <div class="merge-stage">
+            <div class="merge-head">
+              <p class="kicker">{previewKicker(diff)}</p>
+              <h2 title={diff.path}>{fileName(diff.path) || diff.path}</h2>
+              <span class="muted">{fileFolder(diff.path)}</span>
+              <button type="button" class="ghost" onclick={() => (diff = null)}>Volver al grafo</button>
+            </div>
+            {#if imageSrc}
+              <div class="image-preview">
+                <img alt={diff.path} src={imageSrc} />
+              </div>
+            {:else if diff.kind === "text"}
+              <pre class="file-preview">{diff.text}</pre>
+            {:else if diff.too_big || diff.binary || diff.kind === "binary"}
+              <div class="diff-board">
+                <p>No se carga el archivo{diff.too_big ? " porque pasa el tope" : " porque es binario"}.</p>
+                {#if !diff.sha}
+                  <button onclick={() => fail(() => call("open_external", { path: diff.path }))}>Abrir afuera</button>
+                {/if}
+              </div>
+            {:else if !hunks.length}
+              <p class="muted">Sin líneas que mostrar.</p>
+            {:else}
+              <div class="diff-board">
+                {#each hunks as hunk, hunkIndex}
+                  <article class="hunk">
+                    <header>
+                      <code>{hunk.header}</code>
+                      {#if staging}
+                        <button type="button" onclick={() => stageHunk(hunkIndex)}>{diff.cached ? "Sacar hunk" : "Añadir hunk"}</button>
+                      {/if}
+                    </header>
+                    {#each hunk.lines as line, lineIndex}
+                      <div class="diff-line" class:add={lineKind(line) === "add"} class:del={lineKind(line) === "del"}>
+                        {#if staging && stageableIndex(hunk.lines, lineIndex) >= 0}
+                          <button
+                            type="button"
+                            class="work-toggle"
+                            class:minus={diff.cached}
+                            title={diff.cached ? "Sacar línea" : "Añadir línea"}
+                            aria-label="{diff.cached ? "Sacar línea" : "Añadir línea"} {lineIndex + 1}"
+                            onclick={() => stageDiffLine(hunkIndex, lineIndex)}
+                          >{@render icon(diff.cached ? "minus" : "plus")}</button>
+                        {:else}
+                          <span class="line-gap"></span>
+                        {/if}
+                        <span class="mono">{line}</span>
+                      </div>
+                    {/each}
+                  </article>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <Graph
+            {commits}
+            selected={selected?.id || ""}
+            onselect={pickCommit}
+            refsWidth={columns.refsWidth}
+            graphWidth={columns.graphWidth}
+            sideOpen={columns.side}
+            detailOpen={columns.detail}
+            onToggle={(name) => setColumn(name, !columns[name])}
+            onRefs={(width, save) => { columns = { ...columns, refsWidth: width }; if (save) saveColumns(); }}
+            onGraph={(width, save) => { columns = { ...columns, graphWidth: width }; if (save) saveColumns(); }}
+            fields={columns.graphColumns}
+            {branches}
+            current={info.branch || ""}
+            onpick={(name) => fail(async () => { await call("switch_branch", { name }); await loadRepo(); })}
+          />
+          {#if !done}<button onclick={more}>Más historial</button>{/if}
+        {/if}
       </main>
 
-      <aside class="detail">
-        <div class="section">
+      <aside class="detail" class:shut={!columns.detail}>
+        {#if columns.detail}
+        <button type="button" class="splitter detail-splitter" aria-label="Ancho del detalle" onpointerdown={(event) => dragColumn(event, "detailWidth")}></button>
+        {:else}
+        <button
+          type="button"
+          class="rail"
+          aria-expanded="false"
+          aria-label="Expandir detalle"
+          onclick={() => setColumn("detail", true)}
+        >
+          {@render icon("sliders")}
+          <span>Detalle</span>
+        </button>
+        {/if}
+        {#if columns.detail}
+        <div class="section desk">
           <h2>Trabajo</h2>
-          <p class="muted">{profile?.name ? `${profile.name} <${profile.email}>` : "Identidad de git"}</p>
-          <select onchange={(event) => fail(() => call("set_repo_profile", { profileId: event.target.value || null }).then(() => call("active_profile")).then((value) => profile = value))}>
-            <option value="">Sin perfil</option>
-            {#each profiles.profiles as item}
-              <option value={item.id} selected={profile?.id === item.id}>{item.label}</option>
-            {/each}
-          </select>
-          {#each info.files as file}
-            <div class="rowish">
-              <button class="file" class:conflict={file.conflict} onclick={() => file.conflict ? fail(async () => { conflict = await call("conflict_text", { path: file.path }); diff = null; }) : showDiff(file.path, false)}>{file.path}</button>
-              {#if !file.conflict}
-                <button onclick={() => fail(async () => { await call("stage_file", { path: file.path, stage: !file.staged }); await loadRepo(); })}>{file.staged ? "Unstage" : "Stage"}</button>
-              {/if}
+          <div class="who-box">
+            <p class="work-kicker">Identidad</p>
+            <select aria-label="Perfil de git" onchange={(event) => fail(() => call("set_repo_profile", { profileId: event.target.value || null }).then(() => call("active_profile")).then((value) => profile = value))}>
+              <option value="">Sin perfil</option>
+              {#each profiles.profiles as item}
+                <option value={item.id} selected={profile?.id === item.id}>{item.label}</option>
+              {/each}
+            </select>
+            {#if profile?.name || profile?.email}
+              <p class="who-mail">{profile.name}{profile.email ? ` · ${profile.email}` : ""}</p>
+            {/if}
+          </div>
+          {#if !info.files.length}
+            <p class="work-empty">Sin cambios</p>
+          {/if}
+          {#each groupWorkFiles(info.files) as group (group.id)}
+            <p class="work-kicker">{group.title} <span>{group.files.length}</span></p>
+            <div class="work-list">
+              {#each group.files as file (group.id + file.path)}
+                <div class="work-row" class:on={(!diff?.sha && diff?.path === file.path) || conflict?.path === file.path} class:conflict={file.conflict}>
+                  <button
+                    type="button"
+                    class="work-file"
+                    title={file.path}
+                    onclick={() => file.conflict ? fail(async () => { conflict = await call("conflict_text", { path: file.path }); diff = null; selected = null; }) : fail(() => showPreview(file.path, { cached: group.id === "staged" }))}
+                  >
+                    <span class="work-name">{fileName(file.path) || file.path}</span>
+                    {#if fileFolder(file.path)}<span class="work-dir">{fileFolder(file.path)}</span>{/if}
+                  </button>
+                  {#if group.id !== "conflict"}
+                    <button
+                      type="button"
+                      class="work-toggle"
+                      class:minus={group.id === "staged"}
+                      title={group.id === "staged" ? "Sacar del índice" : "Añadir al índice"}
+                      aria-label="{group.id === "staged" ? "Sacar del índice" : "Añadir al índice"} {file.path}"
+                      onclick={() => fail(async () => { await call("stage_file", { path: file.path, stage: group.id !== "staged" }); await loadRepo(); })}
+                    >{@render icon(group.id === "staged" ? "minus" : "plus")}</button>
+                  {/if}
+                </div>
+              {/each}
             </div>
           {/each}
-          <textarea rows="4" placeholder="Mensaje del commit" bind:value={message}></textarea>
-          <button class="primary" onclick={() => fail(async () => { await call("commit", { message }); message = ""; await loadRepo(); })}>Commit</button>
+          <div class="commit-box">
+            <textarea rows="3" placeholder="Mensaje del commit" bind:value={message}></textarea>
+            <button class="primary" disabled={!message.trim()} onclick={() => fail(async () => { const filled = fillTemplate(message, workVars()) || message.trim(); await call("commit", { message: filled }); message = fillTemplate(templates.commit, workVars()) || ""; await loadRepo(); })}>Commit</button>
+          </div>
         </div>
-        {#if diff}
+        {#if conflict?.too_big}
           <div class="section">
-            <h2>{diff.path}</h2>
-            {#if diff.too_big || diff.binary}
-              <p>No se carga el archivo{diff.too_big ? " porque pasa el tope" : " porque es binario"}.</p>
-              <button onclick={() => fail(() => call("open_external", { path: diff.path }))}>Abrir afuera</button>
-            {:else}
-              {#each changedLines(diff.text) as hunk, hunkIndex}
-                <button onclick={() => stageHunk(hunkIndex)}>Stage hunk</button>
-                {#each hunk.lines as line, lineIndex}
-                  <div class="diff-line" class:add={line.startsWith("+")} class:del={line.startsWith("-")}>
-                    <button onclick={() => stageLine(hunkIndex, lineIndex)}>línea</button>
-                    <span class="mono">{line}</span>
-                  </div>
-                {/each}
-              {/each}
-            {/if}
+            <h2>Conflicto</h2>
+            <p>El conflicto pasa el tope.</p>
+            <button onclick={() => fail(() => call("open_external", { path: conflict.path }))}>Abrir afuera</button>
+            <button onclick={() => fail(() => call("mergetool", { path: conflict.path }))}>Herramienta de merge</button>
           </div>
         {/if}
-        {#if conflict}
-          <div class="section">
-            {#if conflict.too_big}
-              <p>El conflicto pasa el tope.</p>
-              <button onclick={() => fail(() => call("open_external", { path: conflict.path }))}>Abrir afuera</button>
-              <button onclick={() => fail(() => call("mergetool", { path: conflict.path }))}>Herramienta de merge</button>
-            {:else}
-              <Merge path={conflict.path} ours={conflict.ours} theirs={conflict.theirs} bind:result={conflict.result} onsave={saveResult} />
-              <button onclick={() => ask("Quedarme con el nuestro pisa el archivo.", async () => { await call("resolve_side", { path: conflict.path, ours: true, confirm: true }); conflict = null; await loadRepo(); })}>Quedarme con el nuestro</button>
-              <button onclick={() => ask("Quedarme con el suyo pisa el archivo.", async () => { await call("resolve_side", { path: conflict.path, ours: false, confirm: true }); conflict = null; await loadRepo(); })}>Quedarme con el suyo</button>
-            {/if}
-          </div>
-        {/if}
-        <div class="section">
+        <div class="section desk">
           <h2>Rebase visual</h2>
-          <input placeholder="base, por ejemplo main" bind:value={prBase} />
-          <button onclick={() => (steps = commits.slice(0, 12).map((commit) => ({ sha: commit.id, action: "pick", message: commit.summary })))}>Cargar</button>
+          <div class="rebase-load">
+            <input placeholder="base, por ejemplo main" aria-label="Base del rebase" bind:value={prBase} />
+            <button type="button" onclick={() => (steps = commits.slice(0, 12).map((commit) => ({ sha: commit.id, action: "pick", message: fillTemplate(templates.reword, workVars({ sha: commit.id, summary: commit.summary })) || commit.summary })))}>Cargar</button>
+          </div>
           {#each steps as step, index}
             <div class="rowish">
               <span class="mono">{step.sha.slice(0, 7)}</span>
@@ -783,20 +1141,32 @@
               <button onclick={() => { const next = [...steps]; const swap = next[index - 1]; if (!swap) return; next[index - 1] = next[index]; next[index] = swap; steps = next; }}>Subir</button>
             </div>
           {/each}
-          <button onclick={() => ask("Esto reescribe la rama con la lista de arriba.", async () => { await call("replay", { base: prBase, steps: [...steps].reverse() }); steps = []; await loadRepo(); })}>Aplicar</button>
+          <button type="button" class="rebase-apply" onclick={() => ask("Esto reescribe la rama con la lista de arriba.", async () => { await call("replay", { base: prBase, steps: [...steps].reverse() }); steps = []; await loadRepo(); })}>Aplicar</button>
         </div>
         {#if selected}
           <div class="section">
-            <h2>{selected.summary}</h2>
-            <p class="muted">{selected.author} · {selected.refs}</p>
-            {#each files as file}<p class="mono">{file}</p>{/each}
+            <h2 class="commit-title">{selected.summary}</h2>
+            <p class="muted commit-meta">{selected.author} · {selected.refs}</p>
+            <div class="work-list">
+              {#each files as file (file)}
+                <div class="work-row solo" class:on={diff?.sha === selected.id && diff?.path === file}>
+                  <button type="button" class="work-file" title={file} onclick={() => fail(() => showPreview(file, { sha: selected.id }))}>
+                    <span class="work-name">{fileName(file) || file}</span>
+                    {#if fileFolder(file)}<span class="work-dir">{fileFolder(file)}</span>{/if}
+                  </button>
+                </div>
+              {/each}
+            </div>
             <button class="danger" onclick={() => ask(`Reset hard a ${selected.id.slice(0, 7)}. El trabajo sin commit se pierde. Puedes volver al commit anterior en esta sesión.`, async () => { await call("reset_hard", { target: selected.id, confirm: true }); await loadRepo(); })}>Reset hard</button>
             <button onclick={() => fail(async () => { await call("undo_reset"); await loadRepo(); })}>Volver a ese commit</button>
           </div>
         {/if}
+        {/if}
       </aside>
     </div>
   {/if}
+    </div>
+  </div>
 
   {#if branchMenu}
     <div
@@ -817,8 +1187,14 @@
       >
         <p class="kicker">{branchMenu.current ? "Rama actual" : "Otra rama"}</p>
         <p class="context-name">{branchMenu.branch}</p>
-        {#each branchMenuItems(branchMenu.current) as item (item.id)}
-          <button type="button" role="menuitem" onclick={() => runBranchAction(item.id)}>{@render icon(item.icon)} {item.label}</button>
+        {#each branchMenuItems(branchMenu.current, branchMenu.branch, info?.branch || "").filter((item) => !(branchMenu.remote && item.id === "switch")) as item (item.id)}
+          <button type="button" role="menuitem" onclick={() => runBranchAction(item.id)}>
+            {@render icon(item.icon)}
+            <span class="menu-copy">
+              <span>{item.label}</span>
+              {#if item.flow}<small class="flow">{item.flow}</small>{/if}
+            </span>
+          </button>
         {/each}
       </div>
     </div>
@@ -833,7 +1209,7 @@
         <div class="actions">
           <button onclick={() => (dragMenu = null)}>Cancelar</button>
           <button onclick={() => { const menu = dragMenu; dragMenu = null; fail(async () => { await call("switch_branch", { name: menu.source }); await call("rebase_branch", { upstream: menu.branch }); await loadRepo(); }); }}>Rebase</button>
-          <button class="primary" onclick={() => { const menu = dragMenu; dragMenu = null; fail(async () => { await call("switch_branch", { name: menu.branch }); await call("merge", { branch: menu.source }); await loadRepo(); }); }}>Merge</button>
+          <button class="primary" onclick={() => { const menu = dragMenu; dragMenu = null; fail(async () => { await call("switch_branch", { name: menu.branch }); info = { ...info, branch: menu.branch }; await runMerge(menu.source); }); }}>Merge</button>
         </div>
       </div>
     </div>
