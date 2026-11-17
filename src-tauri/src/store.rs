@@ -180,6 +180,184 @@ pub fn set_repo_profile(path: &Path, profile_id: Option<&str>) -> Result<(), Str
     save_profiles(&file)
 }
 
+fn default_true() -> bool {
+    true
+}
+fn default_side_width() -> u32 {
+    268
+}
+fn default_detail_width() -> u32 {
+    360
+}
+fn default_refs_width() -> u32 {
+    220
+}
+fn default_graph_width() -> u32 {
+    160
+}
+fn default_graph_columns() -> Vec<String> {
+    ["refs", "graph", "message", "date"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn keep_graph_columns(columns: &[String]) -> Vec<String> {
+    const ORDER: [&str; 6] = ["refs", "graph", "message", "author", "date", "hash"];
+    let picked: Vec<String> = ORDER
+        .iter()
+        .filter(|id| columns.iter().any(|item| item == *id))
+        .map(|id| (*id).to_string())
+        .collect();
+    if picked.is_empty() {
+        default_graph_columns()
+    } else {
+        picked
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Columns {
+    #[serde(default = "default_true")]
+    pub side: bool,
+    #[serde(default = "default_true")]
+    pub detail: bool,
+    #[serde(default = "default_side_width")]
+    pub side_width: u32,
+    #[serde(default = "default_detail_width")]
+    pub detail_width: u32,
+    #[serde(default = "default_refs_width")]
+    pub refs_width: u32,
+    #[serde(default = "default_graph_width")]
+    pub graph_width: u32,
+    #[serde(default = "default_graph_columns")]
+    pub graph_columns: Vec<String>,
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        Self {
+            side: true,
+            detail: true,
+            side_width: default_side_width(),
+            detail_width: default_detail_width(),
+            refs_width: default_refs_width(),
+            graph_width: default_graph_width(),
+            graph_columns: default_graph_columns(),
+        }
+    }
+}
+
+pub fn layout() -> Result<Columns, String> {
+    let path = data_dir().join("layout.json");
+    if !path.exists() {
+        return Ok(Columns::default());
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(serde_json::from_str(&text).unwrap_or_default())
+}
+
+pub fn save_layout(columns: &Columns) -> Result<(), String> {
+    let dir = ensure()?;
+    let columns = Columns {
+        side: columns.side,
+        detail: columns.detail,
+        side_width: columns.side_width.clamp(180, 480),
+        detail_width: columns.detail_width.clamp(240, 560),
+        refs_width: columns.refs_width.clamp(140, 420),
+        graph_width: columns.graph_width.clamp(64, 720),
+        graph_columns: keep_graph_columns(&columns.graph_columns),
+    };
+    let json = serde_json::to_string_pretty(&columns).map_err(|e| e.to_string())?;
+    fs::write(dir.join("layout.json"), json).map_err(|e| e.to_string())
+}
+
+fn default_merge_template() -> String {
+    "Merge branch '{branch}' into {current}".into()
+}
+fn default_stash_template() -> String {
+    "WIP on {current}: {summary}".into()
+}
+fn default_cherry_template() -> String {
+    "Cherry-pick {sha} onto {current}".into()
+}
+fn default_rebase_template() -> String {
+    "Rebase {current} onto {branch}".into()
+}
+fn default_reword_template() -> String {
+    "{summary}".into()
+}
+fn default_pr_template() -> String {
+    "[{ticket}] {summary}".into()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Templates {
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default = "default_merge_template")]
+    pub merge: String,
+    #[serde(default = "default_stash_template")]
+    pub stash: String,
+    #[serde(default = "default_cherry_template")]
+    pub cherry: String,
+    #[serde(default = "default_rebase_template")]
+    pub rebase: String,
+    #[serde(default = "default_reword_template")]
+    pub reword: String,
+    #[serde(default = "default_pr_template")]
+    pub pr: String,
+}
+
+impl Default for Templates {
+    fn default() -> Self {
+        Self {
+            commit: String::new(),
+            merge: default_merge_template(),
+            stash: default_stash_template(),
+            cherry: default_cherry_template(),
+            rebase: default_rebase_template(),
+            reword: default_reword_template(),
+            pr: default_pr_template(),
+        }
+    }
+}
+
+fn clean_template(value: &str) -> Result<String, String> {
+    if value.contains('\0') {
+        return Err("La plantilla no es válida.".into());
+    }
+    if value.len() > 4000 {
+        return Err("La plantilla es demasiado larga.".into());
+    }
+    Ok(value.replace('\r', ""))
+}
+
+pub fn templates() -> Result<Templates, String> {
+    let path = data_dir().join("templates.json");
+    if !path.exists() {
+        return Ok(Templates::default());
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(serde_json::from_str(&text).unwrap_or_default())
+}
+
+pub fn save_templates(templates: &Templates) -> Result<Templates, String> {
+    let dir = ensure()?;
+    let templates = Templates {
+        commit: clean_template(&templates.commit)?,
+        merge: clean_template(&templates.merge)?,
+        stash: clean_template(&templates.stash)?,
+        cherry: clean_template(&templates.cherry)?,
+        rebase: clean_template(&templates.rebase)?,
+        reword: clean_template(&templates.reword)?,
+        pr: clean_template(&templates.pr)?,
+    };
+    let json = serde_json::to_string_pretty(&templates).map_err(|e| e.to_string())?;
+    fs::write(dir.join("templates.json"), json).map_err(|e| e.to_string())?;
+    Ok(templates)
+}
+
 pub fn profile_for(path: &Path) -> Result<Option<Profile>, String> {
     let file = profiles()?;
     let path_text = path.to_string_lossy().to_string();

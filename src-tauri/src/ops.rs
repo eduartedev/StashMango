@@ -32,6 +32,34 @@ pub struct DiffResult {
     pub size: u64,
     pub text: String,
     pub hunks: usize,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default)]
+    pub data: String,
+    #[serde(default)]
+    pub media: String,
+}
+
+impl Default for DiffResult {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            binary: false,
+            too_big: false,
+            size: 0,
+            text: String::new(),
+            hunks: 0,
+            kind: "diff".into(),
+            sha: String::new(),
+            cached: false,
+            data: String::new(),
+            media: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -263,17 +291,169 @@ pub fn diff_file(git: &Path, root: &Path, path: &str, cached: bool) -> Result<Di
         size,
         text: if parsed.binary { String::new() } else { text },
         hunks: parsed.hunks.len(),
+        kind: if parsed.binary { "binary".into() } else { "diff".into() },
+        ..DiffResult::default()
     })
+}
+
+pub fn preview_file(git: &Path, root: &Path, path: &str, cached: bool, sha: &str) -> Result<DiffResult, String> {
+    let rel = relative_in_repo(path)?;
+    if !sha.is_empty() {
+        check_sha(sha)?;
+        if looks_image(&rel) {
+            return preview_blob_image(git, root, sha, &rel);
+        }
+        return preview_commit_diff(git, root, sha, &rel);
+    }
+    if looks_image(&rel) && root.join(&rel).is_file() {
+        return preview_worktree_image(root, &rel, cached);
+    }
+    let mut result = diff_file(git, root, &rel, cached)?;
+    result.cached = cached;
+    if result.too_big || result.binary || !result.text.trim().is_empty() {
+        return Ok(result);
+    }
+    match fs_read_bytes(root, &rel) {
+        Ok(bytes) if bytes.len() > MAX_BYTES => Ok(too_big(rel, bytes.len() as u64)),
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) if text.lines().count() > MAX_LINES => Ok(too_big(rel, text.len() as u64)),
+            Ok(text) => Ok(DiffResult {
+                path: rel,
+                size: text.len() as u64,
+                text,
+                kind: "text".into(),
+                cached,
+                ..DiffResult::default()
+            }),
+            Err(_) => Ok(DiffResult {
+                path: rel,
+                binary: true,
+                kind: "binary".into(),
+                cached,
+                ..DiffResult::default()
+            }),
+        },
+        Err(_) => Ok(result),
+    }
+}
+
+fn preview_commit_diff(git: &Path, root: &Path, sha: &str, rel: &str) -> Result<DiffResult, String> {
+    let out = gitrun::run_ok(
+        git,
+        root,
+        &["show", "--format=", "-U0", "--no-ext-diff", sha, "--", rel],
+        &[],
+        None,
+    )?;
+    let text = out.text();
+    if text.len() > MAX_BYTES || text.lines().count() > MAX_LINES {
+        return Ok(too_big(rel.to_string(), text.len() as u64));
+    }
+    let parsed = patch::parse(&text);
+    Ok(DiffResult {
+        path: rel.to_string(),
+        binary: parsed.binary,
+        size: text.len() as u64,
+        text: if parsed.binary { String::new() } else { text },
+        hunks: parsed.hunks.len(),
+        kind: if parsed.binary { "binary".into() } else { "diff".into() },
+        sha: sha.to_string(),
+        ..DiffResult::default()
+    })
+}
+
+fn preview_worktree_image(root: &Path, rel: &str, cached: bool) -> Result<DiffResult, String> {
+    let bytes = fs_read_bytes(root, rel)?;
+    image_preview(rel, bytes, "", cached)
+}
+
+fn preview_blob_image(git: &Path, root: &Path, sha: &str, rel: &str) -> Result<DiffResult, String> {
+    let spec = format!("{sha}:{rel}");
+    let out = gitrun::run_ok(git, root, &["show", &spec], &[], None)?;
+    image_preview(rel, out.stdout, sha, false)
+}
+
+fn image_preview(rel: &str, bytes: Vec<u8>, sha: &str, cached: bool) -> Result<DiffResult, String> {
+    if bytes.len() > MAX_BYTES {
+        return Ok(too_big(rel.to_string(), bytes.len() as u64));
+    }
+    let Some(media) = image_media(rel) else {
+        return Ok(DiffResult {
+            path: rel.to_string(),
+            binary: true,
+            size: bytes.len() as u64,
+            kind: "binary".into(),
+            sha: sha.to_string(),
+            cached,
+            ..DiffResult::default()
+        });
+    };
+    Ok(DiffResult {
+        path: rel.to_string(),
+        size: bytes.len() as u64,
+        kind: "image".into(),
+        sha: sha.to_string(),
+        cached,
+        data: to_base64(&bytes),
+        media: media.into(),
+        ..DiffResult::default()
+    })
+}
+
+fn looks_image(path: &str) -> bool {
+    image_media(path).is_some()
+}
+
+fn image_media(path: &str) -> Option<&'static str> {
+    match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn to_base64(data: &[u8]) -> String {
+    const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = data.get(i + 1).copied().unwrap_or(0);
+        let b2 = data.get(i + 2).copied().unwrap_or(0);
+        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPH[((triple >> 18) & 63) as usize] as char);
+        out.push(ALPH[((triple >> 12) & 63) as usize] as char);
+        out.push(if i + 1 < data.len() {
+            ALPH[((triple >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if i + 2 < data.len() {
+            ALPH[(triple & 63) as usize] as char
+        } else {
+            '='
+        });
+        i += 3;
+    }
+    out
 }
 
 fn too_big(path: String, size: u64) -> DiffResult {
     DiffResult {
         path,
-        binary: false,
         too_big: true,
         size,
-        text: String::new(),
-        hunks: 0,
+        kind: "binary".into(),
+        ..DiffResult::default()
     }
 }
 
@@ -374,9 +554,43 @@ pub fn local_config(git: &Path, root: &Path, key: &str) -> Result<String, String
     }
 }
 
-pub fn branches(git: &Path, root: &Path) -> Result<Vec<String>, String> {
-    let out = gitrun::run_ok(git, root, &["for-each-ref", "--format=%(refname:short)", "refs/heads"], &[], None)?;
-    Ok(out.text().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BranchRef {
+    pub name: String,
+    pub sha: String,
+    pub remote: bool,
+}
+
+pub fn branches(git: &Path, root: &Path) -> Result<Vec<BranchRef>, String> {
+    let out = gitrun::run_ok(
+        git,
+        root,
+        &["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/remotes"],
+        &[],
+        None,
+    )?;
+    let mut list = Vec::new();
+    for line in out.text().lines() {
+        let Some((sha, full)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let (remote, name) = if let Some(rest) = full.strip_prefix("refs/remotes/") {
+            (true, rest)
+        } else if let Some(rest) = full.strip_prefix("refs/heads/") {
+            (false, rest)
+        } else {
+            continue;
+        };
+        if name.is_empty() || sha.is_empty() {
+            continue;
+        }
+        list.push(BranchRef {
+            name: name.to_string(),
+            sha: sha.to_string(),
+            remote,
+        });
+    }
+    Ok(list)
 }
 
 pub fn create_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> {
@@ -475,9 +689,15 @@ pub fn stash_drop(git: &Path, root: &Path, confirm: bool) -> Result<(), String> 
     Ok(())
 }
 
-pub fn merge(git: &Path, root: &Path, branch: &str) -> Result<GitOut, String> {
+pub fn merge(git: &Path, root: &Path, branch: &str, message: &str) -> Result<GitOut, String> {
     check_branch(git, root, branch)?;
-    gitrun::run(git, root, &["merge", "--no-edit", branch], &[], None)
+    if message.contains('\0') {
+        return Err("El mensaje no es válido.".into());
+    }
+    if message.trim().is_empty() {
+        return gitrun::run(git, root, &["merge", "--no-edit", "--", branch], &[], None);
+    }
+    gitrun::run(git, root, &["merge", "--no-ff", "-m", message, "--", branch], &[], None)
 }
 
 pub fn rebase(git: &Path, root: &Path, upstream: &str) -> Result<(), String> {
@@ -486,9 +706,16 @@ pub fn rebase(git: &Path, root: &Path, upstream: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn cherry_pick(git: &Path, root: &Path, sha: &str) -> Result<(), String> {
+pub fn cherry_pick(git: &Path, root: &Path, sha: &str, message: &str) -> Result<(), String> {
     check_sha(sha)?;
+    if message.contains('\0') {
+        return Err("El mensaje no es válido.".into());
+    }
     gitrun::run_ok(git, root, &["cherry-pick", sha], &[], None)?;
+    if message.trim().is_empty() {
+        return Ok(());
+    }
+    gitrun::run_ok(git, root, &["commit", "--amend", "-F", "-"], &[], Some(message.as_bytes()))?;
     Ok(())
 }
 
@@ -740,4 +967,9 @@ fn worktree_size(root: &Path, rel: &str) -> u64 {
 fn fs_read(root: &Path, rel: &str) -> Result<String, String> {
     let path = canonical_inside(root, rel)?;
     std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+fn fs_read_bytes(root: &Path, rel: &str) -> Result<Vec<u8>, String> {
+    let path = canonical_inside(root, rel)?;
+    std::fs::read(path).map_err(|e| e.to_string())
 }

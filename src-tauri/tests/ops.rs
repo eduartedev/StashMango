@@ -149,6 +149,28 @@ fn commit_with_profile_does_not_change_config() {
 }
 
 #[test]
+fn branches_carry_the_remote_commit() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "uno\n", "init");
+    let bare = tempfile::tempdir().unwrap();
+    run(&git, bare.path(), &["init", "--bare"]);
+    let remote = bare.path().to_string_lossy().to_string();
+    run(&git, dir.path(), &["remote", "add", "origin", &remote]);
+    run(&git, dir.path(), &["push", "-u", "origin", "HEAD"]);
+    run(&git, dir.path(), &["remote", "set-head", "origin", "main"]);
+    let refs = ops::branches(&git, dir.path()).unwrap();
+    let main = refs.iter().find(|item| item.name == "main" && !item.remote).unwrap();
+    let origin = refs.iter().find(|item| item.name == "origin/main" && item.remote).unwrap();
+    assert_eq!(main.sha, origin.sha);
+    assert!(refs.iter().any(|item| item.name == "origin/HEAD" && item.remote));
+    run(&git, dir.path(), &["commit", "--allow-empty", "-m", "adelante"]);
+    let later = ops::branches(&git, dir.path()).unwrap();
+    let local = later.iter().find(|item| item.name == "main" && !item.remote).unwrap();
+    let remote_main = later.iter().find(|item| item.name == "origin/main" && item.remote).unwrap();
+    assert_ne!(local.sha, remote_main.sha);
+}
+
+#[test]
 fn invalid_branch_is_rejected() {
     let (git, dir) = repo();
     assert!(ops::create_branch(&git, dir.path(), "HEAD").is_err());
@@ -179,7 +201,7 @@ fn merge_conflict_and_ours() {
     fs::write(dir.path().join("a.txt"), "suyo\n").unwrap();
     run(&git, dir.path(), &["commit", "-am", "suyo"]);
     run(&git, dir.path(), &["switch", "main"]);
-    let merged = ops::merge(&git, dir.path(), "lado").unwrap();
+    let merged = ops::merge(&git, dir.path(), "lado", "").unwrap();
     assert!(!merged.ok());
     let unmerged = ops::unmerged(&git, dir.path()).unwrap();
     assert!(unmerged.contains("a.txt"));
@@ -202,7 +224,7 @@ fn rebase_and_cherry_pick() {
     run(&git, dir.path(), &["commit", "-m", "feat"]);
     let sha = ops::head_sha(&git, dir.path()).unwrap();
     run(&git, dir.path(), &["switch", "main"]);
-    ops::cherry_pick(&git, dir.path(), &sha).unwrap();
+    ops::cherry_pick(&git, dir.path(), &sha, "").unwrap();
     assert!(dir.path().join("b.txt").exists());
     run(&git, dir.path(), &["switch", "feature"]);
     ops::rebase(&git, dir.path(), "main").unwrap();
@@ -323,6 +345,46 @@ fn default_profile_is_present_and_tokens_stay_out_of_the_file() {
 }
 
 #[test]
+fn layout_roundtrip_keeps_closed_columns() {
+    let _lock = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("STASHMANGO_HOME", home.path()); }
+    let fresh = store::layout().unwrap();
+    assert!(fresh.side && fresh.detail);
+    store::save_layout(&store::Columns {
+        side: false,
+        detail: true,
+        side_width: 9000,
+        detail_width: 400,
+        refs_width: 10,
+        graph_width: 4000,
+        graph_columns: vec!["hash".into(), "nope".into(), "refs".into()],
+    })
+    .unwrap();
+    let again = store::layout().unwrap();
+    assert!(!again.side && again.detail);
+    assert_eq!(again.side_width, 480);
+    assert_eq!(again.detail_width, 400);
+    assert_eq!(again.refs_width, 140);
+    assert_eq!(again.graph_width, 720);
+    assert_eq!(again.graph_columns, vec!["refs".to_string(), "hash".to_string()]);
+    fs::write(home.path().join("layout.json"), r#"{"side":false,"detail":true}"#).unwrap();
+    let partial = store::layout().unwrap();
+    assert!(!partial.side && partial.detail);
+    assert_eq!(partial.side_width, 268);
+    assert_eq!(
+        partial.graph_columns,
+        vec!["refs".to_string(), "graph".to_string(), "message".to_string(), "date".to_string()]
+    );
+    let json = fs::read_to_string(home.path().join("layout.json")).unwrap();
+    assert!(json.contains("\"side\":false"));
+    assert!(!json.contains("token"));
+    fs::write(home.path().join("layout.json"), "{").unwrap();
+    let broken = store::layout().unwrap();
+    assert!(broken.side && broken.detail);
+}
+
+#[test]
 fn profile_roundtrip_has_no_token_field() {
     let _lock = HOME_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -339,6 +401,72 @@ fn profile_roundtrip_has_no_token_field() {
     assert!(!json.contains("token"));
     assert!(json.contains("mango@example.com"));
 }
+
+#[test]
+fn templates_roundtrip_keeps_merge_text() {
+    let _lock = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("STASHMANGO_HOME", home.path()); }
+    let fresh = store::templates().unwrap();
+    assert_eq!(fresh.merge, "Merge branch '{branch}' into {current}");
+    let mut saved = store::Templates::default();
+    saved.commit = "WIP: ".into();
+    store::save_templates(&saved).unwrap();
+    let loaded = store::templates().unwrap();
+    assert_eq!(loaded.commit, "WIP: ");
+    fs::write(home.path().join("templates.json"), "{").unwrap();
+    let broken = store::templates().unwrap();
+    assert_eq!(broken.merge, "Merge branch '{branch}' into {current}");
+}
+
+#[test]
+fn merge_uses_custom_message() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    run(&git, dir.path(), &["branch", "lado"]);
+    run(&git, dir.path(), &["switch", "lado"]);
+    fs::write(dir.path().join("b.txt"), "extra\n").unwrap();
+    run(&git, dir.path(), &["add", "b.txt"]);
+    run(&git, dir.path(), &["commit", "-m", "lado"]);
+    run(&git, dir.path(), &["switch", "main"]);
+    ops::merge(&git, dir.path(), "lado", "Merge branch 'lado' into main").unwrap();
+    let log = gitrun::run_ok(&git, dir.path(), &["log", "-1", "--format=%s"], &[], None).unwrap();
+    assert_eq!(log.text().trim(), "Merge branch 'lado' into main");
+}
+
+#[test]
+fn preview_file_covers_untracked_image_and_commit() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "hola\n", "init");
+    let sha = gitrun::run_ok(&git, dir.path(), &["rev-parse", "HEAD"], &[], None)
+        .unwrap()
+        .text()
+        .trim()
+        .to_string();
+    fs::write(dir.path().join("nuevo.txt"), "sin seguimiento\n").unwrap();
+    let untracked = ops::preview_file(&git, dir.path(), "nuevo.txt", false, "").unwrap();
+    assert_eq!(untracked.kind, "text");
+    assert!(untracked.text.contains("sin seguimiento"), "{}", untracked.text);
+
+    fs::write(dir.path().join("pic.png"), TINY_PNG).unwrap();
+    let image = ops::preview_file(&git, dir.path(), "pic.png", false, "").unwrap();
+    assert_eq!(image.kind, "image");
+    assert_eq!(image.media, "image/png");
+    assert!(!image.data.is_empty());
+
+    let commit = ops::preview_file(&git, dir.path(), "a.txt", false, &sha).unwrap();
+    assert_eq!(commit.kind, "diff");
+    assert_eq!(commit.sha, sha);
+    assert!(commit.text.contains("hola") || commit.text.contains("a.txt"), "{}", commit.text);
+}
+
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+    0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
 
 fn node(id: &str, parents: &[&str]) -> CommitNode {
     CommitNode {

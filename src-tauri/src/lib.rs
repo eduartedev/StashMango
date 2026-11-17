@@ -73,6 +73,26 @@ fn recents() -> Result<Vec<store::Recent>, String> {
 }
 
 #[tauri::command]
+fn layout() -> Result<store::Columns, String> {
+    store::layout()
+}
+
+#[tauri::command]
+fn save_layout(layout: store::Columns) -> Result<(), String> {
+    store::save_layout(&layout)
+}
+
+#[tauri::command]
+fn templates() -> Result<store::Templates, String> {
+    store::templates()
+}
+
+#[tauri::command]
+fn save_templates(templates: store::Templates) -> Result<store::Templates, String> {
+    store::save_templates(&templates)
+}
+
+#[tauri::command]
 fn refresh(state: State<AppState>) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
     let info = ops::info(&state.git.bin, &root)?;
@@ -87,9 +107,9 @@ fn log_page(state: State<AppState>, skip: usize, open_lanes: Vec<Option<String>>
 }
 
 #[tauri::command]
-fn diff_file(state: State<AppState>, path: String, cached: bool) -> Result<ops::DiffResult, String> {
+fn diff_file(state: State<AppState>, path: String, cached: bool, sha: Option<String>) -> Result<ops::DiffResult, String> {
     let root = repo_path(&state)?;
-    ops::diff_file(&state.git.bin, &root, &path, cached)
+    ops::preview_file(&state.git.bin, &root, &path, cached, sha.as_deref().unwrap_or(""))
 }
 
 #[tauri::command]
@@ -121,7 +141,7 @@ fn commit(state: State<AppState>, message: String) -> Result<ops::RepoInfo, Stri
 }
 
 #[tauri::command]
-fn branches(state: State<AppState>) -> Result<Vec<String>, String> {
+fn branches(state: State<AppState>) -> Result<Vec<ops::BranchRef>, String> {
     let root = repo_path(&state)?;
     ops::branches(&state.git.bin, &root)
 }
@@ -188,9 +208,9 @@ fn stash_drop(state: State<AppState>, confirm: bool) -> Result<Vec<String>, Stri
 }
 
 #[tauri::command]
-fn merge(state: State<AppState>, branch: String) -> Result<ops::RepoInfo, String> {
+fn merge(state: State<AppState>, branch: String, message: Option<String>) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
-    let out = ops::merge(&state.git.bin, &root, &branch)?;
+    let out = ops::merge(&state.git.bin, &root, &branch, message.as_deref().unwrap_or(""))?;
     if !out.ok() && !out.err_text().to_lowercase().contains("conflict") && out.code != 1 {
         return Err(out.err_text());
     }
@@ -212,9 +232,9 @@ fn replay(state: State<AppState>, base: String, steps: Vec<ReplayStep>) -> Resul
 }
 
 #[tauri::command]
-fn cherry_pick(state: State<AppState>, sha: String) -> Result<ops::RepoInfo, String> {
+fn cherry_pick(state: State<AppState>, sha: String, message: Option<String>) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
-    ops::cherry_pick(&state.git.bin, &root, &sha)?;
+    ops::cherry_pick(&state.git.bin, &root, &sha, message.as_deref().unwrap_or(""))?;
     ops::info(&state.git.bin, &root)
 }
 
@@ -475,6 +495,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_repo,
             recents,
+            layout,
+            save_layout,
+            templates,
+            save_templates,
             refresh,
             log_page,
             diff_file,
