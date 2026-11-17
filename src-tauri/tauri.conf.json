@@ -14,7 +14,9 @@
       {
         "title": "StashMango",
         "width": 1280,
-        "height": 800
+        "height": 800,
+        "decorations": false,
+        "shadow": true
       }
     ],
     "security": {
