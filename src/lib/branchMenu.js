@@ -1,4 +1,12 @@
-export function branchMenuItems(isCurrent) {
+export function branchFlow(from, to) {
+  const left = String(from || "").trim() || "esta rama";
+  const right = String(to || "").trim() || "rama actual";
+  return `${left} → ${right}`;
+}
+
+export function branchMenuItems(isCurrent, target = "", onto = "") {
+  const from = String(target || "").trim() || "esta rama";
+  const here = String(onto || "").trim() || "rama actual";
   const copy = { id: "copy", label: "Copiar nombre", icon: "copy" };
   if (isCurrent) {
     return [
@@ -9,9 +17,9 @@ export function branchMenuItems(isCurrent) {
     ];
   }
   return [
-    { id: "switch", label: "Cambiar a esta rama", icon: "switch" },
-    { id: "merge", label: "Merge en la rama actual", icon: "merge" },
-    { id: "rebase", label: "Rebase de la actual sobre esta", icon: "rebase" },
+    { id: "switch", label: "Cambiar", flow: branchFlow(here, from), icon: "switch" },
+    { id: "merge", label: "Merge", flow: branchFlow(from, here), icon: "merge" },
+    { id: "rebase", label: "Rebase", flow: branchFlow(here, from), icon: "rebase" },
     copy,
   ];
 }

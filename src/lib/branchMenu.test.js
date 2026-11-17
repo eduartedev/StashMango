@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { branchMenuItems, menuPosition } from "./branchMenu.js";
+import { branchFlow, branchMenuItems, menuPosition } from "./branchMenu.js";
 
 test("la rama actual ofrece red y copiar, no cambiar ni merge", () => {
   const items = branchMenuItems(true);
@@ -9,9 +9,18 @@ test("la rama actual ofrece red y copiar, no cambiar ni merge", () => {
 });
 
 test("otra rama ofrece cambiar, merge y rebase, no la red", () => {
-  const items = branchMenuItems(false);
+  const items = branchMenuItems(false, "main", "develop");
   assert.deepEqual(items.map((item) => item.id), ["switch", "merge", "rebase", "copy"]);
   assert.deepEqual(items.map((item) => item.icon), ["switch", "merge", "rebase", "copy"]);
+  assert.equal(items.find((item) => item.id === "switch").flow, "develop → main");
+  assert.equal(items.find((item) => item.id === "merge").flow, "main → develop");
+  assert.equal(items.find((item) => item.id === "rebase").flow, "develop → main");
+});
+
+test("si faltan nombres, el flujo habla de esta rama y la actual", () => {
+  assert.equal(branchFlow("", ""), "esta rama → rama actual");
+  const items = branchMenuItems(false);
+  assert.equal(items.find((item) => item.id === "merge").flow, "esta rama → rama actual");
 });
 
 test("el menú se queda dentro de la ventana", () => {
