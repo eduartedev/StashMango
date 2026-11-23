@@ -118,7 +118,7 @@
   <div class="body">
   {#if fields.includes("refs")}
   <div class="refcol">
-    {#each commits as commit}
+    {#each commits as commit (commit.id)}
       {@const packed = packRefs(refChips(commit.refs))}
       <div class="refcell" class:selected={selected === commit.id} role="presentation">
         {#if packed.shown}

@@ -1,14 +1,23 @@
 <script>
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { listen } from "@tauri-apps/api/event";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { call } from "$lib/api";
   import { captionToggleTarget } from "$lib/caption.js";
   import { nextSide, sideNav } from "$lib/sideNav.js";
   import { branchMenuItems, menuPosition } from "$lib/branchMenu.js";
   import { branchRows, localBranchNames } from "$lib/branchList.js";
+  import { assertGitflow, defaultGitflow, gitflowKinds, normalizeGitflow } from "$lib/gitflow.js";
   import { clampColumn, graphColumnChoices, layoutPayload, normalizeColumns, toggleGraphColumn } from "$lib/columns.js";
   import { defaultTemplates, fillTemplate, insertToken, normalizeTemplates, sampleVars, templateKinds, templateTokens, templateVars, wrapToken } from "$lib/commitTemplates.js";
   import { settingsNav, settingsSectionOr } from "$lib/settingsNav.js";
+  import { emptyServiceSaved, emptyServiceTokens, gitHadTokenNotice, services, tokenPage } from "$lib/services.js";
+  import { defaultRepoLive, gitHooksDoc } from "$lib/gitHooks.js";
+  import { BUSY_DELAY_MS, ERROR_MS, NOTICE_MS } from "$lib/flash.js";
+  import { branchStamp, keepLog, restoreLog, shouldReloadLog } from "$lib/commitCache.js";
+  import { assertClone, cloneNameFromUrl, joinDest } from "$lib/startRepo.js";
+  import { stashRefOk, stashRows } from "$lib/stashList.js";
   import { diffHunks, lineKind, stageableIndex } from "$lib/diffHunks.js";
   import { canStagePreview, previewImageSrc, previewKicker } from "$lib/previewFile.js";
   import { fileFolder, fileName, groupWorkFiles } from "$lib/workFiles.js";
@@ -20,6 +29,8 @@
   let screen = $state("home");
   let error = $state("");
   let notice = $state("");
+  let busyCount = $state(0);
+  let showBusy = $state(false);
   let recents = $state([]);
   let tabs = $state([]);
   let activePath = $state("");
@@ -29,6 +40,9 @@
   let commits = $state([]);
   let openLanes = $state([]);
   let done = $state(false);
+  const logCache = new Map();
+  let loadBusy = false;
+  let loadAgain = false;
   let branchRefs = $state([]);
   let worktrees = $state([]);
   let stashes = $state([]);
@@ -57,14 +71,15 @@
   let templateKind = $state("merge");
   let templateBox;
   let closedFolders = $state({});
-  const services = [
-    { label: "GitHub", host: "github.com" },
-    { label: "GitLab", host: "gitlab.com" },
-    { label: "Bitbucket", host: "bitbucket.org" },
-  ];
+  let gitflow = $state(defaultGitflow());
+  let repoLive = $state(defaultRepoLive());
+  let branchQuery = $state("");
+  let homeForm = $state("");
+  let cloneUrl = $state("");
+  let cloneDest = $state("");
   let profileForm = $state({ id: "default", label: "default", name: "", email: "" });
-  let serviceTokens = $state({ "github.com": "", "gitlab.com": "", "bitbucket.org": "" });
-  let serviceSaved = $state({ "github.com": false, "gitlab.com": false, "bitbucket.org": false });
+  let serviceTokens = $state(emptyServiceTokens());
+  let serviceSaved = $state(emptyServiceSaved());
 
   async function boot() {
     try {
@@ -78,28 +93,105 @@
   }
   boot();
 
-  async function fail(run) {
+  async function fail(run, opts = {}) {
     error = "";
+    const quiet = Boolean(opts.quiet);
+    const first = busyCount === 0;
+    let delay;
+    if (!quiet) {
+      busyCount += 1;
+      if (first) delay = setTimeout(() => { showBusy = true; }, BUSY_DELAY_MS);
+    }
     try {
       return await run();
     } catch (err) {
       const text = String(err);
       if (!text.includes("invoke")) error = text;
+    } finally {
+      if (!quiet) {
+        busyCount = Math.max(0, busyCount - 1);
+        if (busyCount === 0) {
+          clearTimeout(delay);
+          showBusy = false;
+        }
+      }
     }
   }
 
+  $effect(() => {
+    const text = notice;
+    if (!text) return;
+    const timer = setTimeout(() => { if (notice === text) notice = ""; }, NOTICE_MS);
+    return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    const text = error;
+    if (!text) return;
+    const timer = setTimeout(() => { if (error === text) error = ""; }, ERROR_MS);
+    return () => clearTimeout(timer);
+  });
+
+  function rememberLog(path, stamp) {
+    if (!path) return;
+    logCache.set(path, {
+      commits,
+      openLanes,
+      done,
+      stamp: stamp ?? logCache.get(path)?.stamp ?? "",
+    });
+  }
+
+  function showCachedLog(path) {
+    const hit = restoreLog(logCache, path);
+    commits = hit.commits;
+    openLanes = hit.openLanes;
+    done = hit.done;
+  }
+
   async function loadRepo() {
+    if (loadBusy) {
+      loadAgain = true;
+      return;
+    }
+    loadBusy = true;
+    try {
+      do {
+        loadAgain = false;
+        await fillRepo();
+      } while (loadAgain);
+    } finally {
+      loadBusy = false;
+    }
+  }
+
+  async function fillRepo() {
+    const path = info?.path;
     info = await call("refresh");
     branchRefs = await call("branches");
+    gitflow = normalizeGitflow(await call("repo_gitflow"));
+    repoLive = await call("repo_live");
     worktrees = await call("worktrees");
     stashes = await call("stash_list");
     profile = await call("active_profile");
     remote = await call("remote");
     profiles = await call("profiles");
-    commits = [];
-    openLanes = [];
-    done = false;
-    await more();
+    const stamp = branchStamp(branchRefs);
+    const cached = path ? logCache.get(path) : null;
+    if (shouldReloadLog(cached, stamp)) {
+      const page = await call("log_page", { skip: 0, openLanes: [] });
+      const next = keepLog(cached || { commits, openLanes, done }, page);
+      if (!next.kept) {
+        commits = next.commits;
+        openLanes = next.openLanes;
+        done = next.done;
+      }
+    } else if (cached && commits !== cached.commits) {
+      commits = cached.commits;
+      openLanes = cached.openLanes;
+      done = cached.done;
+    }
+    rememberLog(info?.path || path, stamp);
     touchTab();
   }
 
@@ -114,31 +206,46 @@
     activePath = info.path;
   }
 
+  async function enterRepo(opened) {
+    if (activePath) {
+      drafts = { ...drafts, [activePath]: message };
+      phrases = { ...phrases, [activePath]: passphrase };
+    }
+    const same = opened.path === activePath;
+    info = opened;
+    screen = "repo";
+    homeForm = "";
+    touchTab();
+    if (!same) {
+      closedFolders = {};
+      branchQuery = "";
+      selected = null;
+      files = [];
+      diff = null;
+      conflict = null;
+      steps = [];
+      prs = [];
+      showCachedLog(opened.path);
+      dragMenu = null;
+      branchMenu = null;
+      message = drafts[info.path] || fillTemplate(templates.commit, workVars()) || "";
+      passphrase = phrases[info.path] || "";
+    }
+    await loadRepo();
+  }
+
   async function choose(path) {
     await fail(async () => {
-      if (activePath) {
-        drafts = { ...drafts, [activePath]: message };
-        phrases = { ...phrases, [activePath]: passphrase };
-      }
       const opened = await call("open_repo", { path });
-      const same = opened.path === activePath;
-      info = opened;
-      screen = "repo";
-      touchTab();
-      if (!same) {
-        selected = null;
-        files = [];
-        diff = null;
-        conflict = null;
-        steps = [];
-        prs = [];
-        commits = [];
-        dragMenu = null;
-        branchMenu = null;
-        message = drafts[info.path] || fillTemplate(templates.commit, workVars()) || "";
-        passphrase = phrases[info.path] || "";
-      }
-      await loadRepo();
+      await enterRepo(opened);
+    });
+  }
+
+  function goHome() {
+    screen = "home";
+    homeForm = "";
+    fail(async () => {
+      recents = await call("recents");
     });
   }
 
@@ -161,7 +268,7 @@
     activePath = "";
     if (!neighbor) {
       info = null;
-      screen = "home";
+      goHome();
       return;
     }
     await choose(neighbor.path);
@@ -172,12 +279,35 @@
     if (path) await choose(path);
   }
 
+  async function createRepo() {
+    homeForm = "";
+    const path = await open({ directory: true });
+    if (!path) return;
+    await fail(async () => {
+      const opened = await call("init_repo", { path });
+      await enterRepo(opened);
+    });
+  }
+
+  async function pickCloneDest() {
+    const path = await open({ directory: true });
+    if (!path) return;
+    cloneDest = joinDest(path, cloneNameFromUrl(cloneUrl));
+  }
+
+  async function cloneNow() {
+    const payload = assertClone(cloneUrl, cloneDest);
+    const opened = await call("clone_repo", payload);
+    await enterRepo(opened);
+  }
+
   async function more() {
     if (done) return;
     const page = await call("log_page", { skip: commits.length, openLanes });
     commits = [...commits, ...page.commits];
     openLanes = page.open_lanes;
     done = page.done;
+    rememberLog(info?.path);
   }
 
   function onScroll(event) {
@@ -338,13 +468,25 @@
   }
 
   function blankTokens() {
-    serviceTokens = { "github.com": "", "gitlab.com": "", "bitbucket.org": "" };
+    serviceTokens = emptyServiceTokens();
+  }
+
+  async function openTokenPage(host) {
+    const url = tokenPage(host);
+    if (!url) return;
+    await openUrl(url);
+  }
+
+  async function fillTokenFromGit(service) {
+    const token = await call("fill_git_token", { host: service.host });
+    serviceTokens = { ...serviceTokens, [service.host]: token };
+    notice = gitHadTokenNotice(service.label);
   }
 
   async function editProfile(item) {
     profileForm = { id: item.id, label: item.label, name: item.name, email: item.email };
     blankTokens();
-    const saved = { "github.com": false, "gitlab.com": false, "bitbucket.org": false };
+    const saved = emptyServiceSaved();
     for (const service of services) {
       saved[service.host] = await call("has_token", { profileId: item.id, host: service.host });
     }
@@ -355,6 +497,10 @@
     profiles = await call("profiles");
     const current = profiles.profiles.find((item) => item.id === profileForm.id) || profiles.profiles[0];
     if (current) await editProfile(current);
+    if (info?.path) {
+      gitflow = normalizeGitflow(await call("repo_gitflow"));
+      repoLive = await call("repo_live");
+    }
   }
 
   function openSettings() {
@@ -365,7 +511,7 @@
   function startProfile() {
     profileForm = { id: crypto.randomUUID(), label: "", name: "", email: "" };
     blankTokens();
-    serviceSaved = { "github.com": false, "gitlab.com": false, "bitbucket.org": false };
+    serviceSaved = emptyServiceSaved();
   }
 
   async function saveCurrent() {
@@ -419,11 +565,36 @@
   }
 
   function toggleFolder(path) {
-    closedFolders = { ...closedFolders, [path]: !closedFolders[path] };
+    const shut = closedFolders[path] !== false;
+    closedFolders = { ...closedFolders, [path]: !shut };
+  }
+
+  async function saveGitflow(patch = {}) {
+    const flow = assertGitflow({ ...gitflow, ...patch });
+    gitflow = normalizeGitflow(await call("set_repo_gitflow", { flow }));
+    closedFolders = {};
   }
 
   let branches = $derived(localBranchNames(branchRefs));
-  let branchList = $derived(branchRows(branchRefs, closedFolders));
+  let branchList = $derived(branchRows(branchRefs, closedFolders, { gitflow, query: branchQuery }));
+  let stashList = $derived(stashRows(stashes));
+
+  async function saveStash() {
+    const filled = (fillTemplate(templates.stash, workVars({ summary: message })) || message || "stash").replace(/\s+/g, " ").trim();
+    await call("stash_push", { message: filled });
+    await loadRepo();
+  }
+
+  async function runStash(kind, id) {
+    if (!stashRefOk(id)) throw new Error("Ese stash no es válido.");
+    if (kind === "drop") {
+      stashes = await call("stash_drop", { id, confirm: true });
+      await loadRepo();
+      return;
+    }
+    await call(kind === "apply" ? "stash_apply" : "stash_pop", { id });
+    await loadRepo();
+  }
 
   let maximized = $state(false);
 
@@ -442,6 +613,34 @@
       maximized = value;
     }).catch(() => {});
   }
+
+  $effect(() => {
+    let alive = true;
+    let unlisten = () => {};
+    let watchTimer;
+    let pendingKind = "";
+    listen("repo-changed", (event) => {
+      if (!alive || screen !== "repo" || !info || conflict || modal) return;
+      pendingKind = event.payload === "git" || pendingKind === "git" ? "git" : "worktree";
+      clearTimeout(watchTimer);
+      watchTimer = setTimeout(() => {
+        const kind = pendingKind;
+        pendingKind = "";
+        fail(async () => {
+          if (kind === "git") await loadRepo();
+          else info = await call("refresh");
+        }, { quiet: true });
+      }, 160);
+    }).then((stop) => {
+      if (alive) unlisten = stop;
+      else stop();
+    }).catch(() => {});
+    return () => {
+      alive = false;
+      clearTimeout(watchTimer);
+      unlisten();
+    };
+  });
 
   $effect(() => {
     const win = frameWindow();
@@ -498,6 +697,63 @@
   </svg>
 {/snippet}
 
+{#snippet mangoWalk()}
+  <svg class="mango-walk" viewBox="0 0 80 100" aria-hidden="true">
+    <g class="mango-arm left">
+      <path d="M24 40c-8 6-12 12-11 18" stroke="#c47a12" stroke-width="6" stroke-linecap="round" fill="none"/>
+      <g class="mango-hand">
+        <circle cx="12" cy="58" r="5.2" fill="#e8941a"/>
+        <ellipse cx="8.2" cy="55.5" rx="2.2" ry="2.8" fill="#e8941a"/>
+      </g>
+    </g>
+    <g class="mango-arm right">
+      <path d="M56 40c8 6 12 12 11 18" stroke="#c47a12" stroke-width="6" stroke-linecap="round" fill="none"/>
+      <g class="mango-hand">
+        <circle cx="68" cy="58" r="5.2" fill="#e8941a"/>
+        <ellipse cx="71.8" cy="55.5" rx="2.2" ry="2.8" fill="#e8941a"/>
+      </g>
+    </g>
+    <g class="mango-body" transform="translate(8 4)">
+      <path d="M32 58c-14 0-22-12-20-26 2-16 14-24 20-26 6 2 18 10 20 26 2 14-6 26-20 26z" fill="#F5B942"/>
+      <path d="M32 54c-8 0-14-8-12-18 1-8 7-14 12-16 5 2 11 8 12 16 2 10-4 18-12 18z" fill="#E8941A"/>
+      <path d="M32 8c1 7 6 11 12 12-7 1-11 5-12 11-1-6-5-10-12-11 6-1 11-5 12-12z" fill="#8EA34A"/>
+      <path d="M14 29h-5" stroke="#14110e" stroke-width="2.2" stroke-linecap="round"/>
+      <path d="M50 29h5" stroke="#14110e" stroke-width="2.2" stroke-linecap="round"/>
+      <rect x="15" y="25" width="14" height="9.5" rx="3" fill="#14110e"/>
+      <rect x="35" y="25" width="14" height="9.5" rx="3" fill="#14110e"/>
+      <path d="M29 29.2h6" stroke="#14110e" stroke-width="2.4" stroke-linecap="round"/>
+      <path d="M17.5 27.2h5" stroke="#fff" stroke-opacity="0.28" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M37.5 27.2h5" stroke="#fff" stroke-opacity="0.28" stroke-width="1.6" stroke-linecap="round"/>
+    </g>
+    <g class="mango-leg left">
+      <path d="M35 58v20" stroke="#c47a12" stroke-width="7" stroke-linecap="round"/>
+      <ellipse cx="32" cy="80" rx="7.5" ry="3.4" fill="#a86810"/>
+    </g>
+    <g class="mango-leg right">
+      <path d="M45 58v20" stroke="#c47a12" stroke-width="7" stroke-linecap="round"/>
+      <ellipse cx="48" cy="80" rx="7.5" ry="3.4" fill="#a86810"/>
+    </g>
+  </svg>
+{/snippet}
+
+{#snippet brand(name)}
+  <svg class="service-logo" viewBox="0 0 24 24" aria-hidden="true">
+    {#if name === "github"}
+      <path fill="#f0f6fc" d="M12 .3C5.37.3 0 5.67 0 12.3c0 5.3 3.44 9.8 8.2 11.39.6.11.82-.26.82-.58 0-.28-.01-1.04-.02-2.04-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.3-1.55 3.3-1.23 3.3-1.23.66 1.66.25 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22 0 1.61-.01 2.9-.01 3.29 0 .32.22.69.83.57C20.56 22.1 24 17.6 24 12.3 24 5.67 18.63.3 12 .3z"/>
+    {:else if name === "gitlab"}
+      <path fill="#E24329" d="M12 21.2 3.7 15.2 2.2 10.5h5.3z"/>
+      <path fill="#FC6D26" d="M12 21.2 7.5 8.7H2.2L3.7 15.2z"/>
+      <path fill="#FCA326" d="M7.5 8.7 5.7 3.2a.4.4 0 0 0-.76 0L2.2 8.7h5.3z"/>
+      <path fill="#E24329" d="m12 21.2 8.3-6 1.5-4.7h-5.3z"/>
+      <path fill="#FC6D26" d="m12 21.2 4.5-12.5h5.3l-1.5 6.5z"/>
+      <path fill="#FCA326" d="m16.5 8.7 1.8-5.5a.4.4 0 0 1 .76 0l2.74 5.5H16.5z"/>
+      <path fill="#FC6D26" d="M7.5 8.7h9L12 21.2z"/>
+    {:else if name === "bitbucket"}
+      <path fill="#2684FF" d="M.78 1.21a.77.77 0 0 0-.77.89l3.26 19.81c.09.5.52.87 1.03.87H19.95a.77.77 0 0 0 .77-.64l3.27-20.04a.77.77 0 0 0-.77-.89zm13.74 14.32H9.52L8.17 8.47h7.56z"/>
+    {/if}
+  </svg>
+{/snippet}
+
 {#snippet icon(name)}
   <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
     {#if name === "branch"}
@@ -533,6 +789,8 @@
       <circle cx="8" cy="5" r="2.1" /><path d="M3.4 13.4c.7-2.5 2.4-3.8 4.6-3.8s3.9 1.3 4.6 3.8" />
     {:else if name === "token"}
       <rect x="2.2" y="3.8" width="11.6" height="8.4" rx="1.4" /><path d="M2.2 7h11.6M5 10h2.6" />
+    {:else if name === "link"}
+      <path d="M9 3.2h3.8V7M12.8 3.4 7.4 8.8M6.2 4.4H3.6A1.2 1.2 0 0 0 2.4 5.6v6.8A1.2 1.2 0 0 0 3.6 13.6h6.8a1.2 1.2 0 0 0 1.2-1.2V9.6" />
     {:else if name === "template"}
       <rect x="3.4" y="2.4" width="9.2" height="11.2" rx="1.2" />
       <path d="M5.4 5.6h5.2M5.4 8h5.2M5.4 10.4h3.2" />
@@ -543,6 +801,8 @@
       <path d="M2.8 5.2V13h7.8" />
     {:else if name === "close"}
       <path d="M4 4l8 8M12 4l-8 8" />
+    {:else if name === "folder"}
+      <path d="M2.4 4.2h4l1.4 1.6h6.2v7.6H2.4z" />
     {:else if name === "plus"}
       <path d="M8 3.2v9.6M3.2 8h9.6" />
     {:else if name === "minus"}
@@ -560,7 +820,7 @@
   <div class="shell">
     {#if screen === "repo" && info}
     <aside class="side" class:shut={!columns.side}>
-      <button class="brand" title="StashMango" onclick={() => (screen = "home")}>{@render mango(28)} <span>StashMango</span></button>
+      <button class="brand" title="StashMango" onclick={goHome}>{@render mango(28)} <span>StashMango</span></button>
       <div class="side-body">
       <nav class="side-nav" aria-label="Paneles del repo">
         {#each sideNav as item (item.id)}
@@ -580,6 +840,10 @@
       {#if sideView === "ramas"}
       <div class="section">
         <p class="kicker">Ramas</p>
+        <input class="branch-search" type="search" placeholder="Buscar rama" bind:value={branchQuery} autocomplete="off" spellcheck="false" />
+          {#if branchQuery.trim() && !branchList.length}
+            <p class="muted">Ninguna rama con ese nombre.</p>
+          {/if}
           {#each branchList as row (row.kind + (row.path || row.branch))}
             {#if row.kind === "folder"}
               <button type="button" class="folder" class:shut={row.shut} style:padding-left={`${8 + row.depth * 12}px`} onclick={() => toggleFolder(row.path)}>
@@ -661,10 +925,28 @@
       {:else if sideView === "stash"}
       <div class="section">
         <p class="kicker">Stash</p>
-          {#each stashes as stash}<p class="mono">{stash}</p>{/each}
-          <button onclick={() => fail(async () => { const filled = (fillTemplate(templates.stash, workVars({ summary: message })) || message || "stash").replace(/\s+/g, " ").trim(); await call("stash_push", { message: filled }); await loadRepo(); })}>Guardar</button>
-          <button onclick={() => fail(async () => { await call("stash_pop"); await loadRepo(); })}>Pop</button>
-          <button class="danger" onclick={() => ask("Soltar el stash más reciente.", async () => { await call("stash_drop", { confirm: true }); await loadRepo(); })}>Drop</button>
+        <div class="stashes">
+          {#if !stashList.length}
+            <p class="muted">No hay nada guardado.</p>
+          {/if}
+          {#each stashList as item (item.id)}
+            <article class="stash">
+              <div class="stash-head">
+                <span class="stash-id">{item.id}</span>
+                {#if item.branch}<span class="stash-branch">{item.branch}</span>{/if}
+              </div>
+              <p class="stash-title">{item.title}</p>
+              <div class="stash-actions">
+                <button type="button" onclick={() => fail(() => runStash("apply", item.id))}>Apply</button>
+                <button type="button" class="primary" onclick={() => fail(() => runStash("pop", item.id))}>Pop</button>
+                <button type="button" class="danger" onclick={() => ask(`Quitar ${item.id}.`, () => runStash("drop", item.id))}>Quitar</button>
+              </div>
+            </article>
+          {/each}
+          <div class="stash-foot">
+            <button type="button" class="primary" onclick={() => fail(saveStash)}>Guardar</button>
+          </div>
+        </div>
       </div>
       {:else if sideView === "prs"}
       <div class="section">
@@ -690,7 +972,7 @@
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <header class="top" data-tauri-drag-region ondblclick={toggleFromCaption}>
         {#if !(screen === "repo" && info)}
-          <button class="brand" onclick={() => (screen = "home")}>{@render mango(28)} StashMango</button>
+          <button class="brand" onclick={goHome}>{@render mango(28)} StashMango</button>
         {/if}
         {#if tabs.length}
           <div class="tabs">
@@ -703,7 +985,7 @@
                 <button class="x" aria-label="Cerrar {tab.name}" onclick={() => closeTab(tab.path)}>×</button>
               </div>
             {/each}
-            <button class="tab-add" onclick={browse}>+</button>
+            <button class="tab-add" type="button" title="Más" aria-label="Más" onclick={goHome}>+</button>
           </div>
         {/if}
         {#if screen === "repo" && info}
@@ -727,8 +1009,8 @@
         </div>
       </header>
 
-  {#if error}<p class="banner error">{error}</p>{/if}
-  {#if notice}<p class="banner ok">{notice}</p>{/if}
+  {#if error}<button type="button" class="banner error" title="Clic para cerrar" onclick={() => (error = "")}>{error}</button>{/if}
+  {#if notice}<button type="button" class="banner ok" title="Clic para cerrar" onclick={() => (notice = "")}>{notice}</button>{/if}
 
   {#if screen === "home"}
     <section class="home">
@@ -737,10 +1019,45 @@
         <div>
           <p class="kicker">Puesto de noche</p>
           <h1>Repos recientes</h1>
-          <p class="lede">El grafo ocupa el centro. Las ramas, el diff y los pull requests responden a lo que tienes abierto.</p>
-          <button class="primary" onclick={browse}>Abrir carpeta</button>
+          <p class="lede">Abre, clona o crea.</p>
         </div>
       </div>
+      <div class="start-actions">
+        <button type="button" class="start-act" onclick={browse}>
+          {@render icon("folder")}
+          <strong>Abrir</strong>
+          <small>Una carpeta que ya es git</small>
+        </button>
+        <button type="button" class="start-act" class:on={homeForm === "clone"} onclick={() => (homeForm = homeForm === "clone" ? "" : "clone")}>
+          {@render icon("pull")}
+          <strong>Clonar</strong>
+          <small>Desde una URL o un repo local</small>
+        </button>
+        <button type="button" class="start-act" onclick={createRepo}>
+          {@render icon("plus")}
+          <strong>Crear</strong>
+          <small>Init en una carpeta vacía</small>
+        </button>
+      </div>
+      {#if homeForm === "clone"}
+        <div class="start-form">
+          <label>
+            URL
+            <input bind:value={cloneUrl} placeholder="https://github.com/org/repo.git" spellcheck="false" />
+          </label>
+          <label>
+            Destino
+            <span class="start-dest">
+              <input bind:value={cloneDest} placeholder="Carpeta nueva" spellcheck="false" />
+              <button type="button" onclick={pickCloneDest}>Elegir</button>
+            </span>
+          </label>
+          <div class="start-form-foot">
+            <button type="button" onclick={() => (homeForm = "")}>Cancelar</button>
+            <button class="primary" onclick={() => fail(cloneNow)}>Clonar</button>
+          </div>
+        </div>
+      {/if}
       {#if recents.length === 0}
         <div class="stage-empty">
           <svg viewBox="0 0 720 200" aria-hidden="true">
@@ -812,22 +1129,34 @@
             </div>
           </article>
         {:else if settingsSection === "servicios"}
-          <article class="plate">
+          <article class="plate services-plate">
             <div class="plate-head">
               <h2>{@render icon("token")} Servicios</h2>
-              <p>Tokens de {profileForm.label || "este perfil"}. El campo vacío deja el token que ya está en el llavero.</p>
+              <p>Tokens de {profileForm.label || "este perfil"}. El campo vacío deja el del llavero. Crear token abre la página; Desde Git usa el que git ya tenga.</p>
             </div>
             <div class="services">
-              {#each services as service}
+              {#each services as service (service.host)}
                 <div class="service">
-                  <div>
-                    <strong>{service.label}</strong>
-                    <span class="muted">{serviceSaved[service.host] ? "Token guardado" : "Sin token"}</span>
+                  <span class="service-mark" data-brand={service.id} aria-hidden="true">{@render brand(service.id)}</span>
+                  <div class="service-head">
+                    <div>
+                      <strong>{service.label}</strong>
+                      <span class="host">{service.host}</span>
+                      <span class="hint">{service.hint}</span>
+                    </div>
+                    <span class="pill" class:on={serviceSaved[service.host]}>{serviceSaved[service.host] ? "Guardado" : "Sin token"}</span>
                   </div>
-                  <input type="password" placeholder="Pegar token" bind:value={serviceTokens[service.host]} autocomplete="off" />
-                  {#if serviceSaved[service.host]}
-                    <button class="danger" onclick={() => fail(async () => { await call("clear_token", { profileId: profileForm.id, host: service.host }); serviceSaved = { ...serviceSaved, [service.host]: false }; })}>Quitar</button>
-                  {/if}
+                  <label class="service-field">
+                    <span>Token</span>
+                    <input type="password" placeholder="Pegar token" bind:value={serviceTokens[service.host]} autocomplete="off" spellcheck="false" />
+                  </label>
+                  <div class="service-actions">
+                    <button type="button" onclick={() => fail(() => openTokenPage(service.host))}>{@render icon("link")} Crear token</button>
+                    <button type="button" onclick={() => fail(() => fillTokenFromGit(service))}>{@render icon("branch")} Desde Git</button>
+                    {#if serviceSaved[service.host]}
+                      <button type="button" class="danger" onclick={() => fail(async () => { await call("clear_token", { profileId: profileForm.id, host: service.host }); serviceSaved = { ...serviceSaved, [service.host]: false }; })}>Quitar</button>
+                    {/if}
+                  </div>
                 </div>
               {/each}
             </div>
@@ -925,6 +1254,80 @@
               <button onclick={() => fail(() => call("set_external_git", { enabled: true }))}>Usar este Git fuera de StashMango</button>
               <button onclick={() => fail(() => call("set_external_git", { enabled: false }))}>Quitarlo del PATH</button>
             </div>
+          </article>
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("merge")} Git Flow</h2>
+              <p>Por defecto: main, master, develop, feature/, release/, hotfix/, support/. Nombres sueltos o prefijos con / al final, separados por coma.</p>
+            </div>
+            {#if info}
+              <div class="column-picks">
+                <label class="column-pick">
+                  <input type="checkbox" checked={gitflow.enabled} onchange={(event) => fail(() => saveGitflow({ enabled: event.currentTarget.checked }))} />
+                  <strong>Usar Git Flow</strong>
+                  <small>{repoName(info.path)}</small>
+                </label>
+              </div>
+              <div class="fields gitflow">
+                {#each gitflowKinds as kind (kind.id)}
+                  <label>
+                    {kind.label}
+                    <input
+                      value={gitflow[kind.id]}
+                      placeholder={kind.def}
+                      spellcheck="false"
+                      oninput={(event) => (gitflow = { ...gitflow, [kind.id]: event.currentTarget.value })}
+                    />
+                    <span class="hint">{kind.hint}. Vacío usa {kind.def}.</span>
+                  </label>
+                {/each}
+              </div>
+              <div class="plate-foot spread">
+                <button type="button" onclick={() => (gitflow = { ...defaultGitflow(), enabled: gitflow.enabled })}>Restablecer ramas</button>
+                <button class="primary" onclick={() => fail(async () => { await saveGitflow(); notice = "Git Flow guardado."; })}>Guardar</button>
+              </div>
+            {:else}
+              <div class="fields">
+                <p class="muted">Abre un repo. Cada uno guarda la suya.</p>
+              </div>
+            {/if}
+          </article>
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("template")} Git Hooks</h2>
+              <p>Scripts que Git corre al commit, merge o push. Esta carpeta vale para este repo y sus worktrees.</p>
+            </div>
+            {#if info}
+              <div class="fields">
+                <label>
+                  Carpeta de hooks
+                  <span class="start-dest">
+                    <input value={repoLive.hooksDir} spellcheck="false" oninput={(event) => (repoLive = { ...repoLive, hooksDir: event.currentTarget.value })} />
+                    <button type="button" onclick={() => fail(async () => { const path = await open({ directory: true }); if (path) repoLive = await call("set_repo_hooks_dir", { path }); })}>Elegir</button>
+                  </span>
+                </label>
+                {#if repoLive.hooks.length}
+                  <p class="hook-names">{repoLive.hooks.join(" · ")}</p>
+                {:else}
+                  <p class="muted">No hay scripts en esa carpeta (los .sample no cuentan).</p>
+                {/if}
+              </div>
+              <div class="column-picks">
+                <label class="column-pick">
+                  <input type="checkbox" checked={repoLive.skipHooks} onchange={(event) => fail(async () => { repoLive = await call("set_repo_skip_hooks", { skip: event.currentTarget.checked }); })} />
+                  <strong>Saltar hooks al hacer commit</strong>
+                  <small>Equivale a --no-verify solo desde StashMango.</small>
+                </label>
+              </div>
+              <div class="plate-foot spread">
+                <button type="button" onclick={() => fail(() => openUrl(gitHooksDoc))}>Documentación de Git</button>
+                <button class="primary" onclick={() => fail(async () => { repoLive = await call("set_repo_hooks_dir", { path: repoLive.hooksDir }); notice = "Hooks guardados."; })}>Guardar carpeta</button>
+              </div>
+            {:else}
+              <div class="fields">
+                <p class="muted">Abre un repo. Cada uno apunta a la suya.</p>
+              </div>
+            {/if}
           </article>
         {:else if settingsSection === "columnas"}
           <article class="plate">
@@ -1080,7 +1483,7 @@
             {/if}
           </div>
           {#if !info.files.length}
-            <p class="work-empty">Sin cambios</p>
+            <p class="work-empty">Sin cambios en el directorio de trabajo.</p>
           {/if}
           {#each groupWorkFiles(info.files) as group (group.id)}
             <p class="work-kicker">{group.title} <span>{group.files.length}</span></p>
@@ -1129,36 +1532,49 @@
             <input placeholder="base, por ejemplo main" aria-label="Base del rebase" bind:value={prBase} />
             <button type="button" onclick={() => (steps = commits.slice(0, 12).map((commit) => ({ sha: commit.id, action: "pick", message: fillTemplate(templates.reword, workVars({ sha: commit.id, summary: commit.summary })) || commit.summary })))}>Cargar</button>
           </div>
-          {#each steps as step, index}
-            <div class="rowish">
-              <span class="mono">{step.sha.slice(0, 7)}</span>
-              <select bind:value={step.action}>
-                <option value="pick">pick</option>
-                <option value="drop">drop</option>
-                <option value="reword">reword</option>
-              </select>
-              <input bind:value={step.message} />
-              <button onclick={() => { const next = [...steps]; const swap = next[index - 1]; if (!swap) return; next[index - 1] = next[index]; next[index] = swap; steps = next; }}>Subir</button>
-            </div>
-          {/each}
-          <button type="button" class="rebase-apply" onclick={() => ask("Esto reescribe la rama con la lista de arriba.", async () => { await call("replay", { base: prBase, steps: [...steps].reverse() }); steps = []; await loadRepo(); })}>Aplicar</button>
-        </div>
-        {#if selected}
-          <div class="section">
-            <h2 class="commit-title">{selected.summary}</h2>
-            <p class="muted commit-meta">{selected.author} · {selected.refs}</p>
-            <div class="work-list">
-              {#each files as file (file)}
-                <div class="work-row solo" class:on={diff?.sha === selected.id && diff?.path === file}>
-                  <button type="button" class="work-file" title={file} onclick={() => fail(() => showPreview(file, { sha: selected.id }))}>
-                    <span class="work-name">{fileName(file) || file}</span>
-                    {#if fileFolder(file)}<span class="work-dir">{fileFolder(file)}</span>{/if}
-                  </button>
-                </div>
+          {#if steps.length}
+            <div class="rebase-steps">
+              {#each steps as step, index (step.sha + index)}
+                <article class="rebase-step">
+                  <div class="rebase-step-head">
+                    <span class="stash-id">{step.sha.slice(0, 7)}</span>
+                    <select bind:value={step.action} aria-label="Acción del rebase">
+                      <option value="pick">pick</option>
+                      <option value="drop">drop</option>
+                      <option value="reword">reword</option>
+                    </select>
+                    <button type="button" disabled={index === 0} onclick={() => { const next = [...steps]; const swap = next[index - 1]; if (!swap) return; next[index - 1] = next[index]; next[index] = swap; steps = next; }}>Subir</button>
+                  </div>
+                  <input bind:value={step.message} aria-label="Mensaje del commit" />
+                </article>
               {/each}
             </div>
-            <button class="danger" onclick={() => ask(`Reset hard a ${selected.id.slice(0, 7)}. El trabajo sin commit se pierde. Puedes volver al commit anterior en esta sesión.`, async () => { await call("reset_hard", { target: selected.id, confirm: true }); await loadRepo(); })}>Reset hard</button>
-            <button onclick={() => fail(async () => { await call("undo_reset"); await loadRepo(); })}>Volver a ese commit</button>
+          {/if}
+          <button type="button" class="rebase-apply" disabled={!steps.length} onclick={() => ask("Esto reescribe la rama con la lista de arriba.", async () => { await call("replay", { base: prBase, steps: [...steps].reverse() }); steps = []; await loadRepo(); })}>Aplicar</button>
+        </div>
+        {#if selected}
+          <div class="section desk">
+            <h2>Commit</h2>
+            <article class="commit-card">
+              <h3 class="commit-title">{selected.summary}</h3>
+              <p class="muted commit-meta">{selected.author}{selected.refs ? ` · ${selected.refs}` : ""}</p>
+              {#if files.length}
+                <div class="work-list">
+                  {#each files as file (file)}
+                    <div class="work-row solo" class:on={diff?.sha === selected.id && diff?.path === file}>
+                      <button type="button" class="work-file" title={file} onclick={() => fail(() => showPreview(file, { sha: selected.id }))}>
+                        <span class="work-name">{fileName(file) || file}</span>
+                        {#if fileFolder(file)}<span class="work-dir">{fileFolder(file)}</span>{/if}
+                      </button>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              <div class="commit-actions">
+                <button type="button" class="danger" onclick={() => ask(`Reset hard a ${selected.id.slice(0, 7)}. El trabajo sin commit se pierde. Puedes volver al commit anterior en esta sesión.`, async () => { await call("reset_hard", { target: selected.id, confirm: true }); await loadRepo(); })}>Reset hard</button>
+                <button type="button" onclick={() => fail(async () => { await call("undo_reset"); await loadRepo(); })}>Volver</button>
+              </div>
+            </article>
           </div>
         {/if}
         {/if}
@@ -1225,6 +1641,13 @@
           <button class="primary" onclick={() => { const action = modal.action; modal = null; fail(action); }}>Confirmar</button>
         </div>
       </div>
+    </div>
+  {/if}
+
+  {#if showBusy}
+    <div class="busy-back" role="status" aria-live="polite" aria-busy="true">
+      {@render mangoWalk()}
+      <p class="kicker">Trabajando</p>
     </div>
   {/if}
 </div>
