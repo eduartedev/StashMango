@@ -2,7 +2,10 @@ use crate::gitrun::{self, GitOut};
 use crate::graph::{self, CommitNode};
 use crate::patch::{self, FileDiff};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+
+const AUTO_STASH: &str = "stashmango-auto";
 
 const PAGE: usize = 300;
 const MAX_BYTES: usize = 1_048_576;
@@ -109,6 +112,140 @@ pub fn open_repo(git: &Path, path: &Path) -> Result<RepoInfo, String> {
     let top = gitrun::run_ok(git, &root, &["rev-parse", "--show-toplevel"], &[], None)?;
     let top = PathBuf::from(top.text().trim());
     info(git, &top)
+}
+
+fn remote_clone_ok(url: &str) -> bool {
+    if url.is_empty() || url.len() > 500 || url.starts_with('-') {
+        return false;
+    }
+    if url.to_ascii_lowercase().contains("ext::") {
+        return false;
+    }
+    if url.starts_with("https://") {
+        let rest = &url["https://".len()..];
+        if rest.contains('@') {
+            return false;
+        }
+        return rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/' | '_' | '~' | '%' | '+' | ':'));
+    }
+    if url.starts_with("ssh://") {
+        return url.contains('@')
+            && url
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/' | '_' | '~' | '%' | '+' | ':' | '@'));
+    }
+    if url.contains("://") {
+        return false;
+    }
+    let Some((user, rest)) = url.split_once('@') else {
+        return false;
+    };
+    if user.is_empty() || user.contains(':') {
+        return false;
+    }
+    let Some((host, path)) = rest.split_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !path.is_empty()
+        && !path.starts_with('/')
+        && url
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/' | '_' | '~' | '+' | '@' | ':'))
+}
+
+pub fn clone_source_ok(raw: &str) -> Result<String, String> {
+    if raw.contains(['\n', '\r', '\0']) {
+        return Err("La URL no es válida.".into());
+    }
+    let url = raw.trim();
+    if remote_clone_ok(url) {
+        return Ok(url.to_string());
+    }
+    let path = PathBuf::from(url);
+    if path.is_absolute() && path.is_dir() && path.join(".git").exists() {
+        return Ok(url.to_string());
+    }
+    Err("La URL no es válida.".into())
+}
+
+fn user_dir(raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() || raw.contains(['\n', '\r', '\0']) {
+        return Err("La carpeta no es válida.".into());
+    }
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err("La carpeta no es válida.".into());
+    }
+    Ok(path)
+}
+
+fn resolve_dir(raw: &str) -> Result<PathBuf, String> {
+    let path = user_dir(raw)?;
+    if path.exists() {
+        if !path.is_dir() {
+            return Err("La carpeta no es válida.".into());
+        }
+        return path
+            .canonicalize()
+            .map_err(|_| "La carpeta no es válida.".to_string());
+    }
+    let parent = path.parent().ok_or_else(|| "La carpeta no es válida.".to_string())?;
+    if !parent.exists() {
+        return Err("La carpeta no es válida.".into());
+    }
+    let parent = parent
+        .canonicalize()
+        .map_err(|_| "La carpeta no es válida.".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "La carpeta no es válida.".to_string())?;
+    if name == "." || name == ".." {
+        return Err("La carpeta no es válida.".into());
+    }
+    Ok(parent.join(name))
+}
+
+fn dir_is_empty(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    let mut entries = std::fs::read_dir(path).map_err(|_| "La carpeta no es válida.".to_string())?;
+    Ok(entries.next().is_none())
+}
+
+pub fn init_repo(git: &Path, path: &str) -> Result<RepoInfo, String> {
+    let root = resolve_dir(path)?;
+    if root.join(".git").exists() {
+        return Err("Esa carpeta ya es un repositorio.".into());
+    }
+    if !root.exists() {
+        std::fs::create_dir(&root).map_err(|_| "No se pudo crear la carpeta.".to_string())?;
+    }
+    gitrun::run_ok(git, &root, &["init", "-b", "main"], &[], None)?;
+    info(git, &root)
+}
+
+pub fn clone_repo(git: &Path, url: &str, dest: &str) -> Result<RepoInfo, String> {
+    let source = clone_source_ok(url)?;
+    let root = resolve_dir(dest)?;
+    if root.join(".git").exists() {
+        return Err("Esa carpeta ya es un repositorio.".into());
+    }
+    if !dir_is_empty(&root)? {
+        return Err("Esa carpeta no está vacía.".into());
+    }
+    let parent = root
+        .parent()
+        .ok_or_else(|| "La carpeta no es válida.".to_string())?;
+    let name = root
+        .file_name()
+        .and_then(|item| item.to_str())
+        .ok_or_else(|| "La carpeta no es válida.".to_string())?;
+    gitrun::run_ok(git, parent, &["clone", "--", &source, name], &[], None)?;
+    open_repo(git, &root)
 }
 
 pub fn info(git: &Path, root: &Path) -> Result<RepoInfo, String> {
@@ -526,7 +663,14 @@ fn apply_patch(git: &Path, root: &Path, patch_text: &str, reverse: bool) -> Resu
     Ok(())
 }
 
-pub fn commit(git: &Path, root: &Path, message: &str, name: Option<&str>, email: Option<&str>) -> Result<(), String> {
+pub fn commit(
+    git: &Path,
+    root: &Path,
+    message: &str,
+    name: Option<&str>,
+    email: Option<&str>,
+    skip_hooks: bool,
+) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("El commit necesita un mensaje.".into());
     }
@@ -541,8 +685,173 @@ pub fn commit(git: &Path, root: &Path, message: &str, name: Option<&str>, email:
         env.push(("GIT_COMMITTER_NAME", name));
         env.push(("GIT_COMMITTER_EMAIL", email));
     }
-    gitrun::run_ok(git, root, &["commit", "-F", "-"], &env, Some(message.as_bytes()))?;
+    let mut args = vec!["commit"];
+    if skip_hooks {
+        args.push("--no-verify");
+    }
+    args.extend(["-F", "-"]);
+    gitrun::run_ok(git, root, &args, &env, Some(message.as_bytes()))?;
     Ok(())
+}
+
+const HOOK_NAMES: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-auto-gc",
+    "post-rewrite",
+    "sendemail-validate",
+    "fsmonitor-watchman",
+];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoLive {
+    pub hooks_dir: String,
+    pub skip_hooks: bool,
+    pub hooks: Vec<String>,
+    pub fsmonitor: bool,
+    pub watchman: bool,
+}
+
+pub fn git_dir(git: &Path, root: &Path) -> Result<PathBuf, String> {
+    let out = gitrun::run_ok(git, root, &["rev-parse", "--git-dir"], &[], None)?;
+    let path = PathBuf::from(out.text().trim());
+    let full = if path.is_absolute() { path } else { root.join(path) };
+    full.canonicalize().map_err(|_| "No se encontró .git.".to_string())
+}
+
+fn set_local(git: &Path, root: &Path, key: &str, value: &str) -> Result<(), String> {
+    if value.contains(['\n', '\r', '\0']) {
+        return Err("Ese valor no es válido.".into());
+    }
+    gitrun::run_ok(git, root, &["config", "--local", key, value], &[], None)?;
+    Ok(())
+}
+
+fn unset_local(git: &Path, root: &Path, key: &str) {
+    let _ = gitrun::run(git, root, &["config", "--local", "--unset-all", key], &[], None);
+}
+
+pub fn watchman_installed() -> bool {
+    let name = if cfg!(windows) { "watchman.exe" } else { "watchman" };
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+}
+
+const FSMONITOR_FILES: usize = 3000;
+
+pub fn should_use_fsmonitor(watchman: bool, files: usize) -> bool {
+    watchman || files >= FSMONITOR_FILES
+}
+
+fn tracked_count(git: &Path, root: &Path) -> Result<usize, String> {
+    let out = gitrun::run_ok(git, root, &["ls-files", "-z"], &[], None)?;
+    Ok(out.stdout.split(|b| *b == 0).filter(|item| !item.is_empty()).count())
+}
+
+pub fn maybe_enable_fsmonitor(git: &Path, root: &Path) -> Result<bool, String> {
+    let current = local_config(git, root, "core.fsmonitor")?;
+    if !current.is_empty() {
+        return Ok(current != "false");
+    }
+    if !should_use_fsmonitor(watchman_installed(), tracked_count(git, root)?) {
+        return Ok(false);
+    }
+    set_local(git, root, "core.fsmonitor", "true")?;
+    Ok(true)
+}
+
+fn plain_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    raw.strip_prefix(r"\\?\").unwrap_or(raw.as_ref()).to_string()
+}
+
+fn hooks_dir_path(git: &Path, root: &Path) -> Result<PathBuf, String> {
+    let out = gitrun::run_ok(git, root, &["rev-parse", "--git-path", "hooks"], &[], None)?;
+    let path = PathBuf::from(out.text().trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(root.join(path))
+    }
+}
+
+fn list_hooks(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let allow: std::collections::HashSet<&str> = HOOK_NAMES.iter().copied().collect();
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sample") || !allow.contains(name.as_str()) {
+            continue;
+        }
+        if entry.file_type().map(|kind| kind.is_file() || kind.is_symlink()).unwrap_or(false) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub fn repo_live(git: &Path, root: &Path) -> Result<RepoLive, String> {
+    let dir = hooks_dir_path(git, root)?;
+    let fsmonitor = local_config(git, root, "core.fsmonitor")?;
+    Ok(RepoLive {
+        hooks_dir: plain_path(&dir),
+        skip_hooks: local_config(git, root, "stashmango.skipHooks")? == "true",
+        hooks: list_hooks(&dir),
+        fsmonitor: !fsmonitor.is_empty() && fsmonitor != "false",
+        watchman: watchman_installed(),
+    })
+}
+
+pub fn set_skip_hooks(git: &Path, root: &Path, skip: bool) -> Result<RepoLive, String> {
+    set_local(git, root, "stashmango.skipHooks", if skip { "true" } else { "false" })?;
+    repo_live(git, root)
+}
+
+pub fn set_fsmonitor(git: &Path, root: &Path, enabled: bool) -> Result<RepoLive, String> {
+    if enabled {
+        set_local(git, root, "core.fsmonitor", "true")?;
+    } else {
+        unset_local(git, root, "core.fsmonitor");
+    }
+    repo_live(git, root)
+}
+
+pub fn set_hooks_dir(git: &Path, root: &Path, raw: &str) -> Result<RepoLive, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        unset_local(git, root, "core.hooksPath");
+        return repo_live(git, root);
+    }
+    if text.contains(['\n', '\r', '\0']) {
+        return Err("La carpeta de hooks no es válida.".into());
+    }
+    let path = PathBuf::from(text);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err("La carpeta de hooks no es válida.".into());
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|_| "La carpeta de hooks no es válida.".to_string())?;
+    set_local(git, root, "core.hooksPath", &plain_path(&path))?;
+    repo_live(git, root)
 }
 
 pub fn local_config(git: &Path, root: &Path, key: &str) -> Result<String, String> {
@@ -552,6 +861,141 @@ pub fn local_config(git: &Path, root: &Path, key: &str) -> Result<String, String
     } else {
         Ok(String::new())
     }
+}
+
+const GITFLOW_KEYS: &[(&str, &str)] = &[
+    ("production", "main, master"),
+    ("develop", "develop"),
+    ("feature", "feature/"),
+    ("release", "release/"),
+    ("hotfix", "hotfix/"),
+    ("support", "support/"),
+];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitFlow {
+    pub enabled: bool,
+    pub production: String,
+    pub develop: String,
+    pub feature: String,
+    pub release: String,
+    pub hotfix: String,
+    pub support: String,
+}
+
+impl Default for GitFlow {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            production: "main, master".into(),
+            develop: "develop".into(),
+            feature: "feature/".into(),
+            release: "release/".into(),
+            hotfix: "hotfix/".into(),
+            support: "support/".into(),
+        }
+    }
+}
+
+impl GitFlow {
+    fn field(&self, id: &str) -> &str {
+        match id {
+            "production" => &self.production,
+            "develop" => &self.develop,
+            "feature" => &self.feature,
+            "release" => &self.release,
+            "hotfix" => &self.hotfix,
+            "support" => &self.support,
+            _ => "",
+        }
+    }
+
+    fn set_field(&mut self, id: &str, value: String) {
+        match id {
+            "production" => self.production = value,
+            "develop" => self.develop = value,
+            "feature" => self.feature = value,
+            "release" => self.release = value,
+            "hotfix" => self.hotfix = value,
+            "support" => self.support = value,
+            _ => {}
+        }
+    }
+}
+
+fn gitflow_token_ok(token: &str) -> bool {
+    if token.is_empty() || token.len() > 120 {
+        return false;
+    }
+    if token.starts_with(['-', '.', '/']) || token.contains("..") || token.contains("//") {
+        return false;
+    }
+    let body = token.strip_suffix('/').unwrap_or(token);
+    !body.is_empty()
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+}
+
+fn gitflow_patterns(raw: &str, fallback: &str, strict: bool) -> Result<String, String> {
+    let mut tokens = Vec::new();
+    for part in raw.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if !gitflow_token_ok(token) {
+            if strict {
+                return Err("Hay un nombre de rama que no es válido.".into());
+            }
+            continue;
+        }
+        if !tokens.iter().any(|item| item == token) {
+            tokens.push(token.to_string());
+        }
+    }
+    if tokens.is_empty() {
+        Ok(fallback.to_string())
+    } else {
+        Ok(tokens.join(", "))
+    }
+}
+
+fn gitflow_config_key(id: &str) -> String {
+    format!("stashmango.gitflow.{id}")
+}
+
+pub fn gitflow(git: &Path, root: &Path) -> Result<GitFlow, String> {
+    let mut flow = GitFlow::default();
+    flow.enabled = local_config(git, root, "stashmango.gitflow")? == "true";
+    for (id, fallback) in GITFLOW_KEYS {
+        let raw = local_config(git, root, &gitflow_config_key(id))?;
+        flow.set_field(id, gitflow_patterns(&raw, fallback, false)?);
+    }
+    Ok(flow)
+}
+
+pub fn set_gitflow(git: &Path, root: &Path, flow: GitFlow) -> Result<GitFlow, String> {
+    let mut clean = GitFlow {
+        enabled: flow.enabled,
+        ..GitFlow::default()
+    };
+    for (id, fallback) in GITFLOW_KEYS {
+        clean.set_field(id, gitflow_patterns(flow.field(id), fallback, true)?);
+    }
+    let flag = if clean.enabled { "true" } else { "false" };
+    gitrun::run_ok(git, root, &["config", "--local", "stashmango.gitflow", flag], &[], None)?;
+    for (id, _) in GITFLOW_KEYS {
+        gitrun::run_ok(
+            git,
+            root,
+            &["config", "--local", &gitflow_config_key(id), clean.field(id)],
+            &[],
+            None,
+        )?;
+    }
+    Ok(clean)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -601,6 +1045,24 @@ pub fn create_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> 
 
 pub fn switch_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> {
     check_branch(git, root, name)?;
+    let dirty = abort_if_busy(git, root)?;
+    if dirty {
+        let clashes = switch_clashes(git, root, name)?;
+        if !clashes.is_empty() {
+            return Err(clash_error("esa rama", clashes));
+        }
+        stash_local(git, root)?;
+        if let Err(err) = gitrun::run_ok(git, root, &["switch", "--", name], &[], None) {
+            let _ = stash_pop(git, root);
+            return Err(err);
+        }
+        if stash_pop(git, root).is_err() {
+            let _ = gitrun::run_ok(git, root, &["switch", "-"], &[], None);
+            let _ = stash_pop(git, root);
+            return Err("Hay cambios locales que chocan con esa rama. No se hizo el cambio.".into());
+        }
+        return Ok(());
+    }
     gitrun::run_ok(git, root, &["switch", "--", name], &[], None)?;
     Ok(())
 }
@@ -615,6 +1077,140 @@ pub fn check_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> {
     } else {
         Err("El nombre de la rama no es válido.".into())
     }
+}
+
+fn abort_if_busy(git: &Path, root: &Path) -> Result<bool, String> {
+    let files = status(git, root)?;
+    if files.iter().any(|file| file.conflict) {
+        return Err("Hay un conflicto en curso.".into());
+    }
+    Ok(!files.is_empty())
+}
+
+fn clash_error(kind: &str, mut files: Vec<String>) -> String {
+    files.sort();
+    files.dedup();
+    let extra = if files.len() > 5 {
+        format!(" y {} más", files.len() - 5)
+    } else {
+        String::new()
+    };
+    let shown = files.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    format!("Hay cambios locales que chocan con {kind}: {shown}{extra}. No se hizo el cambio.")
+}
+
+fn nul_paths(out: &GitOut) -> HashSet<String> {
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+fn diff_names(git: &Path, root: &Path, a: &str, b: &str) -> Result<HashSet<String>, String> {
+    let out = gitrun::run_ok(git, root, &["diff", "--name-only", "-z", a, b], &[], None)?;
+    Ok(nul_paths(&out))
+}
+
+fn tree_names(git: &Path, root: &Path, tree: &str) -> Result<HashSet<String>, String> {
+    let out = gitrun::run_ok(git, root, &["ls-tree", "-r", "--name-only", "-z", tree], &[], None)?;
+    Ok(nul_paths(&out))
+}
+
+fn local_clashes(
+    git: &Path,
+    root: &Path,
+    incoming: &HashSet<String>,
+    incoming_tree: &HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut hits = Vec::new();
+    for file in status(git, root)? {
+        let hit = if file.untracked {
+            incoming_tree.contains(&file.path)
+        } else {
+            incoming.contains(&file.path)
+        };
+        if hit || file.conflict {
+            hits.push(file.path);
+        }
+    }
+    Ok(hits)
+}
+
+fn switch_clashes(git: &Path, root: &Path, target: &str) -> Result<Vec<String>, String> {
+    local_clashes(
+        git,
+        root,
+        &diff_names(git, root, "HEAD", target)?,
+        &tree_names(git, root, target)?,
+    )
+}
+
+fn merge_base_or_dirty(
+    git: &Path,
+    root: &Path,
+    other: &str,
+) -> Result<Option<String>, String> {
+    let out = gitrun::run(git, root, &["merge-base", "HEAD", other], &[], None)?;
+    if out.ok() {
+        let sha = out.text().trim().to_string();
+        if sha.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sha))
+        }
+    } else if status(git, root)?.is_empty() {
+        Ok(None)
+    } else {
+        Err("Hay cambios locales y no se puede calcular la base. No se hizo el cambio.".into())
+    }
+}
+
+fn merge_clashes(git: &Path, root: &Path, other: &str) -> Result<Vec<String>, String> {
+    let Some(base) = merge_base_or_dirty(git, root, other)? else {
+        return Ok(Vec::new());
+    };
+    local_clashes(
+        git,
+        root,
+        &diff_names(git, root, &base, other)?,
+        &tree_names(git, root, other)?,
+    )
+}
+
+fn rebase_clashes(git: &Path, root: &Path, upstream: &str) -> Result<Vec<String>, String> {
+    let Some(base) = merge_base_or_dirty(git, root, upstream)? else {
+        return Ok(Vec::new());
+    };
+    let mut incoming = diff_names(git, root, &base, upstream)?;
+    incoming.extend(diff_names(git, root, &base, "HEAD")?);
+    local_clashes(git, root, &incoming, &tree_names(git, root, upstream)?)
+}
+
+fn stash_local(git: &Path, root: &Path) -> Result<(), String> {
+    gitrun::run_ok(git, root, &["stash", "push", "-u", "-m", AUTO_STASH], &[], None)?;
+    Ok(())
+}
+
+fn rebase_in_progress(git: &Path, root: &Path) -> bool {
+    for name in ["rebase-merge", "rebase-apply"] {
+        let Ok(out) = gitrun::run(git, root, &["rev-parse", "--git-path", name], &[], None) else {
+            continue;
+        };
+        if !out.ok() {
+            continue;
+        }
+        let raw = PathBuf::from(out.text().trim());
+        let full = if raw.is_absolute() {
+            raw
+        } else {
+            root.join(raw)
+        };
+        if full.exists() {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn worktrees(git: &Path, root: &Path) -> Result<Vec<Worktree>, String> {
@@ -676,16 +1272,44 @@ pub fn stash_push(git: &Path, root: &Path, message: &str) -> Result<(), String> 
     Ok(())
 }
 
+pub fn stash_selector(sel: &str) -> Result<String, String> {
+    let raw = sel.trim();
+    let inner = raw
+        .strip_prefix("stash@{")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(|| "Ese stash no es válido.".to_string())?;
+    if inner.is_empty() || inner.len() > 6 || !inner.chars().all(|c| c.is_ascii_digit()) {
+        return Err("Ese stash no es válido.".into());
+    }
+    Ok(format!("stash@{{{inner}}}"))
+}
+
+pub fn stash_apply(git: &Path, root: &Path, sel: &str) -> Result<(), String> {
+    let id = stash_selector(sel)?;
+    gitrun::run_ok(git, root, &["stash", "apply", "--", &id], &[], None)?;
+    Ok(())
+}
+
 pub fn stash_pop(git: &Path, root: &Path) -> Result<(), String> {
-    gitrun::run_ok(git, root, &["stash", "pop"], &[], None)?;
+    stash_pop_at(git, root, "stash@{0}")
+}
+
+pub fn stash_pop_at(git: &Path, root: &Path, sel: &str) -> Result<(), String> {
+    let id = stash_selector(sel)?;
+    gitrun::run_ok(git, root, &["stash", "pop", "--", &id], &[], None)?;
     Ok(())
 }
 
 pub fn stash_drop(git: &Path, root: &Path, confirm: bool) -> Result<(), String> {
+    stash_drop_at(git, root, "stash@{0}", confirm)
+}
+
+pub fn stash_drop_at(git: &Path, root: &Path, sel: &str, confirm: bool) -> Result<(), String> {
     if !confirm {
         return Err("Soltar un stash pide confirmación.".into());
     }
-    gitrun::run_ok(git, root, &["stash", "drop"], &[], None)?;
+    let id = stash_selector(sel)?;
+    gitrun::run_ok(git, root, &["stash", "drop", "--", &id], &[], None)?;
     Ok(())
 }
 
@@ -694,15 +1318,54 @@ pub fn merge(git: &Path, root: &Path, branch: &str, message: &str) -> Result<Git
     if message.contains('\0') {
         return Err("El mensaje no es válido.".into());
     }
-    if message.trim().is_empty() {
-        return gitrun::run(git, root, &["merge", "--no-edit", "--", branch], &[], None);
+    let dirty = abort_if_busy(git, root)?;
+    if dirty {
+        let clashes = merge_clashes(git, root, branch)?;
+        if !clashes.is_empty() {
+            return Err(clash_error("el merge", clashes));
+        }
+        stash_local(git, root)?;
     }
-    gitrun::run(git, root, &["merge", "--no-ff", "-m", message, "--", branch], &[], None)
+    let out = if message.trim().is_empty() {
+        gitrun::run(git, root, &["merge", "--no-edit", "--", branch], &[], None)?
+    } else {
+        gitrun::run(git, root, &["merge", "--no-ff", "-m", message, "--", branch], &[], None)?
+    };
+    if dirty {
+        if let Err(err) = stash_pop(git, root) {
+            if out.ok() {
+                return Err(format!(
+                    "El merge se hizo, pero no se restauraron los cambios locales: {err}"
+                ));
+            }
+            // shortcut: merge en conflicto y el stash no aplica; el trabajo queda en el stash
+        }
+    }
+    Ok(out)
 }
 
 pub fn rebase(git: &Path, root: &Path, upstream: &str) -> Result<(), String> {
     check_branch(git, root, upstream)?;
-    gitrun::run_ok(git, root, &["rebase", upstream], &[], None)?;
+    let dirty = abort_if_busy(git, root)?;
+    if dirty {
+        let clashes = rebase_clashes(git, root, upstream)?;
+        if !clashes.is_empty() {
+            return Err(clash_error("el rebase", clashes));
+        }
+        stash_local(git, root)?;
+    }
+    if let Err(err) = gitrun::run_ok(git, root, &["rebase", upstream], &[], None) {
+        if dirty && rebase_in_progress(git, root) {
+            return Err(format!("{err} Tu trabajo quedó en el stash."));
+        }
+        if dirty {
+            let _ = stash_pop(git, root);
+        }
+        return Err(err);
+    }
+    if dirty {
+        stash_pop(git, root)?;
+    }
     Ok(())
 }
 
@@ -899,6 +1562,26 @@ pub fn open_external(root: &Path, path: &str) -> Result<(), String> {
     let rel = relative_in_repo(path)?;
     let full = canonical_inside(root, &rel)?;
     open::that(&full).map_err(|e| e.to_string())
+}
+
+pub fn git_credential_password(git: &Path, host: &str) -> Result<String, String> {
+    crate::secret::forge_host(host)?;
+    let input = format!("protocol=https\nhost={host}\n\n");
+    let out = gitrun::run(
+        git,
+        &std::env::temp_dir(),
+        &["credential", "fill"],
+        &[("GCM_INTERACTIVE", "never")],
+        Some(input.as_bytes()),
+    )?;
+    if !out.ok() {
+        return Err("Git no tiene un token para ese host.".into());
+    }
+    let Some(password) = crate::secret::parse_credential_password(&out.text()) else {
+        return Err("Git no tiene un token para ese host.".into());
+    };
+    crate::secret::validate_token(&password)?;
+    Ok(password)
 }
 
 pub fn mergetool(git: &Path, root: &Path, path: &str) -> Result<(), String> {

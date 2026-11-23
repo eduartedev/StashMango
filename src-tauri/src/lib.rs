@@ -6,18 +6,20 @@ pub mod pathcfg;
 pub mod prs;
 pub mod secret;
 pub mod store;
+pub mod watch;
 
 use ops::ReplayStep;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 struct AppState {
     git: gitrun::Git,
     repo: Mutex<Option<PathBuf>>,
     undo: Mutex<HashMap<PathBuf, String>>,
+    watch: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 fn store_undo(map: &mut HashMap<PathBuf, String>, root: &Path, sha: String) {
@@ -59,17 +61,40 @@ fn profile_id_for(root: &std::path::Path) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn open_repo(state: State<AppState>, path: String) -> Result<ops::RepoInfo, String> {
+fn open_repo(app: AppHandle, state: State<AppState>, path: String) -> Result<ops::RepoInfo, String> {
     let info = ops::open_repo(&state.git.bin, PathBuf::from(&path).as_path())?;
-    let root = PathBuf::from(&info.path);
-    store::remember(&root, &info.branch)?;
-    *state.repo.lock().map_err(|e| e.to_string())? = Some(root);
-    Ok(info)
+    enter_repo(&app, &state, info)
 }
 
 #[tauri::command]
 fn recents() -> Result<Vec<store::Recent>, String> {
     store::recents()
+}
+
+fn enter_repo(app: &AppHandle, state: &AppState, info: ops::RepoInfo) -> Result<ops::RepoInfo, String> {
+    let root = PathBuf::from(&info.path);
+    store::remember(&root, &info.branch)?;
+    *state.repo.lock().map_err(|e| e.to_string())? = Some(root.clone());
+    let _ = ops::maybe_enable_fsmonitor(&state.git.bin, &root);
+    let git_dir = ops::git_dir(&state.git.bin, &root).unwrap_or_else(|_| root.join(".git"));
+    let mut slot = state.watch.lock().map_err(|e| e.to_string())?;
+    *slot = None;
+    if let Ok(started) = watch::start(app.clone(), root, git_dir) {
+        *slot = Some(started);
+    }
+    Ok(info)
+}
+
+#[tauri::command]
+fn init_repo(app: AppHandle, state: State<AppState>, path: String) -> Result<ops::RepoInfo, String> {
+    let info = ops::init_repo(&state.git.bin, &path)?;
+    enter_repo(&app, &state, info)
+}
+
+#[tauri::command]
+fn clone_repo(app: AppHandle, state: State<AppState>, url: String, dest: String) -> Result<ops::RepoInfo, String> {
+    let info = ops::clone_repo(&state.git.bin, &url, &dest)?;
+    enter_repo(&app, &state, info)
 }
 
 #[tauri::command]
@@ -136,7 +161,15 @@ fn apply_selection(
 fn commit(state: State<AppState>, message: String) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
     let (name, email) = identity(&root)?;
-    ops::commit(&state.git.bin, &root, &message, name.as_deref(), email.as_deref())?;
+    let skip_hooks = ops::local_config(&state.git.bin, &root, "stashmango.skipHooks")? == "true";
+    ops::commit(
+        &state.git.bin,
+        &root,
+        &message,
+        name.as_deref(),
+        email.as_deref(),
+        skip_hooks,
+    )?;
     ops::info(&state.git.bin, &root)
 }
 
@@ -144,6 +177,36 @@ fn commit(state: State<AppState>, message: String) -> Result<ops::RepoInfo, Stri
 fn branches(state: State<AppState>) -> Result<Vec<ops::BranchRef>, String> {
     let root = repo_path(&state)?;
     ops::branches(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn repo_gitflow(state: State<AppState>) -> Result<ops::GitFlow, String> {
+    let root = repo_path(&state)?;
+    ops::gitflow(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn set_repo_gitflow(state: State<AppState>, flow: ops::GitFlow) -> Result<ops::GitFlow, String> {
+    let root = repo_path(&state)?;
+    ops::set_gitflow(&state.git.bin, &root, flow)
+}
+
+#[tauri::command]
+fn repo_live(state: State<AppState>) -> Result<ops::RepoLive, String> {
+    let root = repo_path(&state)?;
+    ops::repo_live(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn set_repo_skip_hooks(state: State<AppState>, skip: bool) -> Result<ops::RepoLive, String> {
+    let root = repo_path(&state)?;
+    ops::set_skip_hooks(&state.git.bin, &root, skip)
+}
+
+#[tauri::command]
+fn set_repo_hooks_dir(state: State<AppState>, path: String) -> Result<ops::RepoLive, String> {
+    let root = repo_path(&state)?;
+    ops::set_hooks_dir(&state.git.bin, &root, &path)
 }
 
 #[tauri::command]
@@ -194,16 +257,23 @@ fn stash_push(state: State<AppState>, message: String) -> Result<ops::RepoInfo, 
 }
 
 #[tauri::command]
-fn stash_pop(state: State<AppState>) -> Result<ops::RepoInfo, String> {
+fn stash_apply(state: State<AppState>, id: String) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
-    ops::stash_pop(&state.git.bin, &root)?;
+    ops::stash_apply(&state.git.bin, &root, &id)?;
     ops::info(&state.git.bin, &root)
 }
 
 #[tauri::command]
-fn stash_drop(state: State<AppState>, confirm: bool) -> Result<Vec<String>, String> {
+fn stash_pop(state: State<AppState>, id: String) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
-    ops::stash_drop(&state.git.bin, &root, confirm)?;
+    ops::stash_pop_at(&state.git.bin, &root, &id)?;
+    ops::info(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn stash_drop(state: State<AppState>, id: String, confirm: bool) -> Result<Vec<String>, String> {
+    let root = repo_path(&state)?;
+    ops::stash_drop_at(&state.git.bin, &root, &id, confirm)?;
     ops::stash_list(&state.git.bin, &root)
 }
 
@@ -327,6 +397,11 @@ fn has_token(profile_id: String, host: String) -> Result<bool, String> {
 #[tauri::command]
 fn clear_token(profile_id: String, host: String) -> Result<(), String> {
     secret::clear_token(&profile_id, &host)
+}
+
+#[tauri::command]
+fn fill_git_token(state: State<AppState>, host: String) -> Result<String, String> {
+    ops::git_credential_password(&state.git.bin, &host)
 }
 
 fn token_for(root: &std::path::Path, host: &str) -> Result<String, String> {
@@ -491,10 +566,13 @@ pub fn run() {
             git: gitrun::resolve(),
             repo: Mutex::new(None),
             undo: Mutex::new(HashMap::new()),
+            watch: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             open_repo,
             recents,
+            init_repo,
+            clone_repo,
             layout,
             save_layout,
             templates,
@@ -506,6 +584,11 @@ pub fn run() {
             apply_selection,
             commit,
             branches,
+            repo_gitflow,
+            set_repo_gitflow,
+            repo_live,
+            set_repo_skip_hooks,
+            set_repo_hooks_dir,
             create_branch,
             switch_branch,
             worktrees,
@@ -513,6 +596,7 @@ pub fn run() {
             remove_worktree,
             stash_list,
             stash_push,
+            stash_apply,
             stash_pop,
             stash_drop,
             merge,
@@ -530,6 +614,7 @@ pub fn run() {
             save_token,
             has_token,
             clear_token,
+            fill_git_token,
             list_prs,
             create_pr,
             merge_pr,

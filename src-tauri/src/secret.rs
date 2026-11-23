@@ -20,6 +20,25 @@ pub fn validate_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn forge_host(host: &str) -> Result<(), String> {
+    validate_host(host)?;
+    if !matches!(host, "github.com" | "gitlab.com" | "bitbucket.org") {
+        return Err("Ese servicio no está soportado.".into());
+    }
+    Ok(())
+}
+
+pub fn parse_credential_password(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(password) = line.strip_prefix("password=") {
+            if !password.is_empty() {
+                return Some(password.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn token_account(profile_id: &str, host: &str) -> Result<String, String> {
     validate_host(host)?;
     if profile_id.is_empty()
@@ -91,4 +110,31 @@ pub fn credential_get(input: &str) -> Result<String, String> {
     Ok(format!(
         "protocol={protocol}\nhost={host}\nusername={user}\npassword={token}\n"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_credential_password_reads_only_the_secret() {
+        let text = "protocol=https\nhost=github.com\nusername=git\npassword=ghp_supersecreto\n";
+        assert_eq!(
+            parse_credential_password(text).as_deref(),
+            Some("ghp_supersecreto")
+        );
+        assert_eq!(parse_credential_password("protocol=https\npassword=\n"), None);
+        assert_eq!(parse_credential_password(""), None);
+    }
+
+    #[test]
+    fn forge_host_only_allows_the_three() {
+        assert!(forge_host("github.com").is_ok());
+        assert!(forge_host("gitlab.com").is_ok());
+        assert!(forge_host("bitbucket.org").is_ok());
+        let err = forge_host("evil.example").unwrap_err();
+        assert_eq!(err, "Ese servicio no está soportado.");
+        assert!(!err.contains("evil"));
+        assert_eq!(forge_host("github.com/oops").unwrap_err(), "El host no es válido.");
+    }
 }

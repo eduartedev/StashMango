@@ -140,7 +140,7 @@ fn commit_with_profile_does_not_change_config() {
     unsafe { std::env::set_var("STASHMANGO_HOME", home.path()); }
     fs::write(dir.path().join("a.txt"), "uno\n").unwrap();
     ops::stage_file(&git, dir.path(), "a.txt", true).unwrap();
-    ops::commit(&git, dir.path(), "hola", Some("Mango"), Some("mango@example.com")).unwrap();
+    ops::commit(&git, dir.path(), "hola", Some("Mango"), Some("mango@example.com"), false).unwrap();
     let author = gitrun::run_ok(&git, dir.path(), &["log", "-1", "--format=%an %ae"], &[], None).unwrap();
     assert_eq!(author.text().trim(), "Mango mango@example.com");
     assert_eq!(ops::local_config(&git, dir.path(), "user.name").unwrap(), "Otro");
@@ -171,6 +171,103 @@ fn branches_carry_the_remote_commit() {
 }
 
 #[test]
+fn gitflow_flag_lives_in_the_repo() {
+    let (git, dir) = repo();
+    let empty = ops::gitflow(&git, dir.path()).unwrap();
+    assert!(!empty.enabled);
+    assert_eq!(empty.production, "main, master");
+    assert_eq!(empty.feature, "feature/");
+
+    run(&git, dir.path(), &["config", "--local", "stashmango.gitflow", "true"]);
+    let legacy = ops::gitflow(&git, dir.path()).unwrap();
+    assert!(legacy.enabled);
+    assert_eq!(legacy.develop, "develop");
+
+    let mut custom = ops::GitFlow::default();
+    custom.enabled = true;
+    custom.production = "trunk".into();
+    custom.feature = "cotizador-web, wip/".into();
+    let saved = ops::set_gitflow(&git, dir.path(), custom).unwrap();
+    assert_eq!(saved.production, "trunk");
+    assert_eq!(saved.feature, "cotizador-web, wip/");
+    let loaded = ops::gitflow(&git, dir.path()).unwrap();
+    assert!(loaded.enabled);
+    assert_eq!(loaded.production, "trunk");
+    assert_eq!(loaded.feature, "cotizador-web, wip/");
+    assert_eq!(loaded.release, "release/");
+
+    let mut bad = ops::GitFlow::default();
+    bad.production = "main\nmaster".into();
+    assert!(ops::set_gitflow(&git, dir.path(), bad).is_err());
+    let mut glob = ops::GitFlow::default();
+    glob.feature = "*".into();
+    assert!(ops::set_gitflow(&git, dir.path(), glob).is_err());
+}
+
+#[test]
+fn hooks_fsmonitor_and_skip_live_in_the_repo() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "uno\n", "init");
+    assert!(!ops::should_use_fsmonitor(false, 12));
+    assert!(ops::should_use_fsmonitor(true, 12));
+    assert!(ops::should_use_fsmonitor(false, 3000));
+    assert!(!ops::maybe_enable_fsmonitor(&git, dir.path()).unwrap());
+    let live = ops::repo_live(&git, dir.path()).unwrap();
+    assert!(live.hooks_dir.to_lowercase().contains("hooks"));
+    assert!(!live.skip_hooks);
+    assert!(!live.fsmonitor);
+    assert!(ops::set_skip_hooks(&git, dir.path(), true).unwrap().skip_hooks);
+    assert!(ops::set_fsmonitor(&git, dir.path(), true).unwrap().fsmonitor);
+    assert_eq!(ops::local_config(&git, dir.path(), "core.fsmonitor").unwrap(), "true");
+    assert!(!ops::set_fsmonitor(&git, dir.path(), false).unwrap().fsmonitor);
+    let extra = tempfile::tempdir().unwrap();
+    fs::write(extra.path().join("pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+    let named = ops::set_hooks_dir(&git, dir.path(), extra.path().to_str().unwrap()).unwrap();
+    assert!(named.hooks.iter().any(|item| item == "pre-commit"));
+    assert!(ops::set_hooks_dir(&git, dir.path(), "relativa").is_err());
+    assert!(ops::set_hooks_dir(&git, dir.path(), "C:\\hooks\n").is_err());
+
+    fs::write(dir.path().join("a.txt"), "dos\n").unwrap();
+    ops::stage_file(&git, dir.path(), "a.txt", true).unwrap();
+    let hook = dir.path().join(".git/hooks/pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    ops::set_hooks_dir(&git, dir.path(), "").unwrap();
+    let blocked = ops::commit(&git, dir.path(), "con hook", None, None, false);
+    if blocked.is_err() {
+        ops::commit(&git, dir.path(), "sin hook", None, None, true).unwrap();
+    }
+}
+
+#[test]
+fn init_repo_creates_main_and_refuses_twice() {
+    let git = git();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("nuevo");
+    let info = ops::init_repo(&git, dest.to_str().unwrap()).unwrap();
+    assert_eq!(info.branch, "main");
+    assert!(dest.join(".git").exists());
+    let err = ops::init_repo(&git, dest.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("ya es un repositorio"));
+}
+
+#[test]
+fn clone_repo_copies_local_and_rejects_junk() {
+    let (git, src) = repo();
+    commit_file(&git, src.path(), "a.txt", "uno\n", "init");
+    let dest_root = tempfile::tempdir().unwrap();
+    let dest = dest_root.path().join("copia");
+    let info = ops::clone_repo(&git, src.path().to_str().unwrap(), dest.to_str().unwrap()).unwrap();
+    assert!(dest.join("a.txt").exists());
+    assert_eq!(info.branch, "main");
+    assert!(ops::clone_source_ok("ext::sh -c whoami").is_err());
+    assert!(ops::clone_source_ok("https://github.com/org/repo.git\n").is_err());
+    assert!(ops::clone_source_ok("https://user:pass@github.com/org/repo.git").is_err());
+    assert!(ops::clone_source_ok("https://github.com/org/repo.git").is_ok());
+    assert!(ops::clone_source_ok("git@github.com:org/repo.git").is_ok());
+    assert!(ops::clone_repo(&git, "https://github.com/org/repo.git", "relativa").is_err());
+}
+
+#[test]
 fn invalid_branch_is_rejected() {
     let (git, dir) = repo();
     assert!(ops::create_branch(&git, dir.path(), "HEAD").is_err());
@@ -188,6 +285,154 @@ fn stash_roundtrip() {
     ops::stash_pop(&git, dir.path()).unwrap();
     let text = fs::read_to_string(dir.path().join("a.txt")).unwrap();
     assert_eq!(text, "dos\n");
+}
+
+#[test]
+fn stash_apply_pop_and_drop_target_the_entry() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    fs::write(dir.path().join("a.txt"), "primero\n").unwrap();
+    ops::stash_push(&git, dir.path(), "uno").unwrap();
+    fs::write(dir.path().join("a.txt"), "segundo\n").unwrap();
+    ops::stash_push(&git, dir.path(), "dos").unwrap();
+    assert_eq!(ops::stash_list(&git, dir.path()).unwrap().len(), 2);
+    assert!(ops::stash_selector("stash@{0};rm").is_err());
+    ops::stash_apply(&git, dir.path(), "stash@{1}").unwrap();
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "primero\n");
+    assert_eq!(ops::stash_list(&git, dir.path()).unwrap().len(), 2);
+    run(&git, dir.path(), &["checkout", "--", "a.txt"]);
+    ops::stash_drop_at(&git, dir.path(), "stash@{1}", true).unwrap();
+    assert_eq!(ops::stash_list(&git, dir.path()).unwrap().len(), 1);
+    ops::stash_pop_at(&git, dir.path(), "stash@{0}").unwrap();
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "segundo\n");
+}
+
+#[test]
+fn switch_keeps_safe_local_changes() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    commit_file(&git, dir.path(), "extra.txt", "extra\n", "extra");
+    run(&git, dir.path(), &["branch", "otra"]);
+    run(&git, dir.path(), &["switch", "otra"]);
+    commit_file(&git, dir.path(), "b.txt", "lado\n", "lado");
+    run(&git, dir.path(), &["switch", "main"]);
+    fs::write(dir.path().join("extra.txt"), "local\n").unwrap();
+    fs::write(dir.path().join("nuevo.txt"), "sin seguimiento\n").unwrap();
+    ops::switch_branch(&git, dir.path(), "otra").unwrap();
+    assert_eq!(ops::info(&git, dir.path()).unwrap().branch, "otra");
+    assert_eq!(fs::read_to_string(dir.path().join("extra.txt")).unwrap(), "local\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("nuevo.txt")).unwrap(),
+        "sin seguimiento\n"
+    );
+    assert!(dir.path().join("b.txt").exists());
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
+}
+
+#[test]
+fn switch_aborts_when_local_changes_clash() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    run(&git, dir.path(), &["branch", "otra"]);
+    run(&git, dir.path(), &["switch", "otra"]);
+    fs::write(dir.path().join("a.txt"), "otro\n").unwrap();
+    run(&git, dir.path(), &["commit", "-am", "otro"]);
+    run(&git, dir.path(), &["switch", "main"]);
+    fs::write(dir.path().join("a.txt"), "local\n").unwrap();
+    let err = ops::switch_branch(&git, dir.path(), "otra").unwrap_err();
+    assert!(err.contains("choca"), "{err}");
+    assert!(err.contains("a.txt"), "{err}");
+    assert_eq!(ops::info(&git, dir.path()).unwrap().branch, "main");
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "local\n");
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
+}
+
+#[test]
+fn switch_aborts_when_untracked_would_overwrite() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    run(&git, dir.path(), &["branch", "otra"]);
+    run(&git, dir.path(), &["switch", "otra"]);
+    commit_file(&git, dir.path(), "foo.txt", "en otra\n", "foo");
+    run(&git, dir.path(), &["switch", "main"]);
+    fs::write(dir.path().join("foo.txt"), "local sin seguimiento\n").unwrap();
+    let err = ops::switch_branch(&git, dir.path(), "otra").unwrap_err();
+    assert!(err.contains("choca"), "{err}");
+    assert_eq!(ops::info(&git, dir.path()).unwrap().branch, "main");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("foo.txt")).unwrap(),
+        "local sin seguimiento\n"
+    );
+}
+
+#[test]
+fn merge_keeps_safe_local_changes() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    commit_file(&git, dir.path(), "extra.txt", "extra\n", "extra");
+    run(&git, dir.path(), &["branch", "lado"]);
+    run(&git, dir.path(), &["switch", "lado"]);
+    commit_file(&git, dir.path(), "b.txt", "lado\n", "lado");
+    run(&git, dir.path(), &["switch", "main"]);
+    fs::write(dir.path().join("extra.txt"), "local\n").unwrap();
+    let out = ops::merge(&git, dir.path(), "lado", "").unwrap();
+    assert!(out.ok(), "{}", out.err_text());
+    assert_eq!(fs::read_to_string(dir.path().join("extra.txt")).unwrap(), "local\n");
+    assert!(dir.path().join("b.txt").exists());
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
+}
+
+#[test]
+fn merge_aborts_when_local_changes_clash() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "base\n", "init");
+    run(&git, dir.path(), &["branch", "lado"]);
+    run(&git, dir.path(), &["switch", "lado"]);
+    fs::write(dir.path().join("a.txt"), "lado\n").unwrap();
+    run(&git, dir.path(), &["commit", "-am", "lado"]);
+    run(&git, dir.path(), &["switch", "main"]);
+    fs::write(dir.path().join("a.txt"), "local\n").unwrap();
+    let err = ops::merge(&git, dir.path(), "lado", "").unwrap_err();
+    assert!(err.contains("choca"), "{err}");
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "local\n");
+    assert!(!dir.path().join(".git").join("MERGE_HEAD").exists());
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
+}
+
+#[test]
+fn rebase_keeps_safe_local_changes() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "uno\n", "init");
+    commit_file(&git, dir.path(), "extra.txt", "extra\n", "extra");
+    run(&git, dir.path(), &["branch", "feature"]);
+    fs::write(dir.path().join("a.txt"), "main\n").unwrap();
+    run(&git, dir.path(), &["commit", "-am", "en main"]);
+    run(&git, dir.path(), &["switch", "feature"]);
+    commit_file(&git, dir.path(), "b.txt", "feat\n", "feat");
+    fs::write(dir.path().join("extra.txt"), "local\n").unwrap();
+    ops::rebase(&git, dir.path(), "main").unwrap();
+    assert_eq!(fs::read_to_string(dir.path().join("extra.txt")).unwrap(), "local\n");
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "main\n");
+    assert!(dir.path().join("b.txt").exists());
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
+}
+
+#[test]
+fn rebase_aborts_when_local_changes_clash() {
+    let (git, dir) = repo();
+    commit_file(&git, dir.path(), "a.txt", "uno\n", "init");
+    run(&git, dir.path(), &["branch", "feature"]);
+    fs::write(dir.path().join("a.txt"), "main\n").unwrap();
+    run(&git, dir.path(), &["commit", "-am", "en main"]);
+    run(&git, dir.path(), &["switch", "feature"]);
+    fs::write(dir.path().join("a.txt"), "local\n").unwrap();
+    let err = ops::rebase(&git, dir.path(), "main").unwrap_err();
+    assert!(err.contains("choca"), "{err}");
+    assert_eq!(ops::info(&git, dir.path()).unwrap().branch, "feature");
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "local\n");
+    assert!(!dir.path().join(".git").join("rebase-merge").exists());
+    assert!(ops::stash_list(&git, dir.path()).unwrap().is_empty());
 }
 
 #[test]
@@ -301,6 +546,15 @@ fn push_to_local_remote_without_token() {
     assert!(!json.contains(secret));
     assert!(secret::validate_token(secret).is_ok());
     assert!(secret::validate_token("con espacio").is_err());
+}
+
+#[test]
+fn git_credential_rejects_unknown_host_without_echoing_it() {
+    let git = git();
+    let err = ops::git_credential_password(&git, "evil.example").unwrap_err();
+    assert_eq!(err, "Ese servicio no está soportado.");
+    assert!(!err.contains("evil"));
+    assert!(!err.contains("ghp_"));
 }
 
 #[test]
