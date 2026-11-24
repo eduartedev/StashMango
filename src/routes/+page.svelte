@@ -817,10 +817,67 @@
 {/snippet}
 
 <div class="app" class:repo={screen === "repo"} class:side-shut={screen === "repo" && !columns.side} style:--side="{columns.sideWidth}px">
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <header class="top" data-tauri-drag-region ondblclick={toggleFromCaption}>
+    <button class="brand" onclick={goHome}>{@render mango(28)} StashMango</button>
+    <span class="spacer" data-tauri-drag-region></span>
+    <button class="ghost" onclick={openSettings}>{@render icon("sliders")} Configuración</button>
+    <div class="win-controls">
+      <button type="button" aria-label="Minimizar" onclick={minimizeWindow}>{@render icon("minus")}</button>
+      <button type="button" aria-label={maximized ? "Restaurar" : "Maximizar"} onclick={toggleWindow}>{@render icon(maximized ? "restore" : "maximize")}</button>
+      <button type="button" class="close" aria-label="Cerrar" onclick={closeWindow}>{@render icon("close")}</button>
+    </div>
+  </header>
+  {#if screen === "repo" && info}
+  <header class="top-secondary">
+    {#if tabs.length}
+      <div class="tabs">
+        {#each tabs as tab (tab.id)}
+          <div class="tab" class:active={tab.path === activePath && screen === "repo"}>
+            <button class="tab-main" onclick={() => focusTab(tab.path)}>
+              <span>{tab.name}</span>
+              <small>{tab.branch || "HEAD"}</small>
+            </button>
+            <button class="x" aria-label="Cerrar {tab.name}" onclick={() => closeTab(tab.path)}>×</button>
+          </div>
+        {/each}
+        <button class="tab-add" type="button" title="Más" aria-label="Más" onclick={goHome}>+</button>
+      </div>
+    {/if}
+    <div class="profile-selector">
+      <select aria-label="Perfil de git" onchange={(event) => {
+        const value = event.target.value;
+        if (value === "new") {
+          settingsSection = "perfiles";
+          openSettings();
+          event.target.value = profile?.id || "";
+          return;
+        }
+        fail(() => call("set_repo_profile", { profileId: value || null }).then(() => call("active_profile")).then((val) => profile = val));
+      }}>
+        <option value="new">Agregar perfil</option>
+        {#each profiles.profiles as item}
+          <option value={item.id} selected={profile?.id === item.id}>{item.label}</option>
+        {/each}
+      </select>
+    </div>
+  </header>
+  <header class="top-tertiary">
+    <div class="dock">
+      <span class="chip" title={info.branch || "HEAD"}>
+        <span class="chip-kicker">{@render icon("branch")} Rama</span>
+        <span class="chip-name">{info.branch || "HEAD"}</span>
+      </span>
+      <span class="dock-rule" aria-hidden="true"></span>
+      <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")} Fetch</button>
+      <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")} Pull</button>
+      <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")} Push</button>
+    </div>
+  </header>
+  {/if}
   <div class="shell">
     {#if screen === "repo" && info}
     <aside class="side" class:shut={!columns.side}>
-      <button class="brand" title="StashMango" onclick={goHome}>{@render mango(28)} <span>StashMango</span></button>
       <div class="side-body">
       <nav class="side-nav" aria-label="Paneles del repo">
         {#each sideNav as item (item.id)}
@@ -969,46 +1026,6 @@
     </aside>
     {/if}
     <div class="stage">
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <header class="top" data-tauri-drag-region ondblclick={toggleFromCaption}>
-        {#if !(screen === "repo" && info)}
-          <button class="brand" onclick={goHome}>{@render mango(28)} StashMango</button>
-        {/if}
-        {#if tabs.length}
-          <div class="tabs">
-            {#each tabs as tab (tab.id)}
-              <div class="tab" class:active={tab.path === activePath && screen === "repo"}>
-                <button class="tab-main" onclick={() => focusTab(tab.path)}>
-                  <span>{tab.name}</span>
-                  <small>{tab.branch || "HEAD"}</small>
-                </button>
-                <button class="x" aria-label="Cerrar {tab.name}" onclick={() => closeTab(tab.path)}>×</button>
-              </div>
-            {/each}
-            <button class="tab-add" type="button" title="Más" aria-label="Más" onclick={goHome}>+</button>
-          </div>
-        {/if}
-        {#if screen === "repo" && info}
-          <div class="dock">
-            <span class="chip" title={info.branch || "HEAD"}>
-              <span class="chip-kicker">{@render icon("branch")} Rama</span>
-              <span class="chip-name">{info.branch || "HEAD"}</span>
-            </span>
-            <span class="dock-rule" aria-hidden="true"></span>
-            <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")} Fetch</button>
-            <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")} Pull</button>
-            <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")} Push</button>
-          </div>
-        {/if}
-        <span class="spacer" data-tauri-drag-region></span>
-        <button class="ghost" onclick={openSettings}>{@render icon("sliders")} Configuración</button>
-        <div class="win-controls">
-          <button type="button" aria-label="Minimizar" onclick={minimizeWindow}>{@render icon("minus")}</button>
-          <button type="button" aria-label={maximized ? "Restaurar" : "Maximizar"} onclick={toggleWindow}>{@render icon(maximized ? "restore" : "maximize")}</button>
-          <button type="button" class="close" aria-label="Cerrar" onclick={closeWindow}>{@render icon("close")}</button>
-        </div>
-      </header>
-
   {#if error}<button type="button" class="banner error" title="Clic para cerrar" onclick={() => (error = "")}>{error}</button>{/if}
   {#if notice}<button type="button" class="banner ok" title="Clic para cerrar" onclick={() => (notice = "")}>{notice}</button>{/if}
 
@@ -1104,28 +1121,34 @@
               <p>El perfil default ya existe. Aquí van el nombre y el correo. No se puede borrar.</p>
             </div>
             {#if profiles.profiles.length}
-              <ul class="people">
-                {#each profiles.profiles as item}
-                  <li class:active={item.id === profileForm.id}>
-                    <button class="branch" onclick={() => fail(() => editProfile(item))}>
-                      <strong>{item.label}</strong>
-                      <span class="muted">{item.name ? `${item.name} <${item.email}>` : "Sin firma todavía"}</span>
-                    </button>
-                    {#if item.id !== "default"}
-                      <button class="danger" onclick={() => fail(async () => { profiles = await call("delete_profile", { id: item.id }); if (profileForm.id === item.id) await editProfile(profiles.profiles.find((profile) => profile.id === "default")); })}>Borrar</button>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
+              <div class="profile-list">
+                <h3>Perfiles existentes</h3>
+                <div class="profile-items">
+                  {#each profiles.profiles as item}
+                    <div class="profile-item" class:active={item.id === profileForm.id}>
+                      <button class="profile-select" onclick={() => fail(() => editProfile(item))}>
+                        <strong>{item.label}</strong>
+                        <span class="muted">{item.name ? `${item.name} <${item.email}>` : "Sin firma todavía"}</span>
+                      </button>
+                      {#if item.id !== "default"}
+                        <button class="danger" onclick={() => fail(async () => { profiles = await call("delete_profile", { id: item.id }); if (profileForm.id === item.id) await editProfile(profiles.profiles.find((profile) => profile.id === "default")); })}>Borrar</button>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              </div>
             {/if}
-            <div class="fields">
-              <label>Etiqueta <input bind:value={profileForm.label} /></label>
-              <label>Nombre <input bind:value={profileForm.name} /></label>
-              <label>Correo <input bind:value={profileForm.email} /></label>
-            </div>
-            <div class="plate-foot spread">
-              <button onclick={startProfile}>Otro perfil</button>
-              <button class="primary" onclick={() => fail(saveCurrent)}>Guardar</button>
+            <div class="profile-form">
+              <h3>{profileForm.id === "default" ? "Editar perfil" : "Nuevo perfil"}</h3>
+              <div class="fields">
+                <label>Etiqueta <input bind:value={profileForm.label} /></label>
+                <label>Nombre <input bind:value={profileForm.name} /></label>
+                <label>Correo <input bind:value={profileForm.email} /></label>
+              </div>
+              <div class="plate-foot spread">
+                <button onclick={startProfile}>Nuevo perfil</button>
+                <button class="primary" onclick={() => fail(saveCurrent)}>Guardar</button>
+              </div>
             </div>
           </article>
         {:else if settingsSection === "servicios"}
@@ -1470,18 +1493,12 @@
         {#if columns.detail}
         <div class="section desk">
           <h2>Trabajo</h2>
+          {#if profile?.name || profile?.email}
           <div class="who-box">
             <p class="work-kicker">Identidad</p>
-            <select aria-label="Perfil de git" onchange={(event) => fail(() => call("set_repo_profile", { profileId: event.target.value || null }).then(() => call("active_profile")).then((value) => profile = value))}>
-              <option value="">Sin perfil</option>
-              {#each profiles.profiles as item}
-                <option value={item.id} selected={profile?.id === item.id}>{item.label}</option>
-              {/each}
-            </select>
-            {#if profile?.name || profile?.email}
-              <p class="who-mail">{profile.name}{profile.email ? ` · ${profile.email}` : ""}</p>
-            {/if}
+            <p class="who-mail">{profile.name}{profile.email ? ` · ${profile.email}` : ""}</p>
           </div>
+          {/if}
           {#if !info.files.length}
             <p class="work-empty">Sin cambios en el directorio de trabajo.</p>
           {/if}
