@@ -1,6 +1,10 @@
 import { gitflowBucket, gitflowKinds, normalizeGitflow } from "./gitflow.js";
 
 const GITFLOW_ORDER = [...gitflowKinds.map((kind) => kind.id), "otras"];
+const KIND_LABEL = {
+  ...Object.fromEntries(gitflowKinds.map((kind) => [kind.id, kind.label])),
+  otras: "Otras",
+};
 
 function asRef(ref) {
   if (typeof ref === "string") {
@@ -107,30 +111,78 @@ function toItems(refs, shortKey) {
   }));
 }
 
-function pushGitflow(rows, prefix, items, closed, depth, reveal, rules) {
-  const buckets = new Map(GITFLOW_ORDER.map((id) => [id, []]));
-  for (const item of items) {
-    const { id, rest } = gitflowBucket(item.name, rules);
-    buckets.get(id).push({ ...item, name: rest });
-  }
-  for (const id of GITFLOW_ORDER) {
-    const list = buckets.get(id);
-    if (!list.length) continue;
-    const path = `${prefix}/${id}`;
-    const shut = folderShut(closed, path, reveal);
-    rows.push({ kind: "folder", path, name: id, depth, shut, count: list.length });
-    if (!shut) walkTree(branchTree(list), depth + 1, path, closed, rows, reveal);
-  }
-}
-
-function pushGroup(rows, path, name, refs, closed, rules, reveal) {
+function pushGroup(rows, path, name, refs, closed, reveal) {
   if (!refs.length) return;
   const shut = folderShut(closed, path, reveal);
-  rows.push({ kind: "folder", path, name, depth: 0, shut, count: refs.length });
+  rows.push({ kind: "folder", path, name, depth: 0, shut, count: refs.length, remote: name !== "local" });
   if (shut) return;
   const items = toItems(refs, (ref) => (ref.short || ref.name));
-  if (rules.enabled) pushGitflow(rows, path, items, closed, 1, reveal, rules);
-  else walkTree(branchTree(items), 1, path, closed, rows, reveal);
+  walkTree(branchTree(items), 1, path, closed, rows, reveal);
+}
+
+function splitSources(list) {
+  const locals = [];
+  const remotes = new Map();
+  for (const ref of list) {
+    if (!ref.remote) {
+      locals.push(ref);
+      continue;
+    }
+    const parts = splitRemote(ref.name);
+    if (!parts) continue;
+    if (!remotes.has(parts.remote)) {
+      remotes.set(parts.remote, []);
+    }
+    remotes.get(parts.remote).push({ ...ref, short: parts.rest });
+  }
+  return { locals, remotes };
+}
+
+function gitflowRows(locals, remotes, closed, rules, reveal) {
+  const buckets = new Map(GITFLOW_ORDER.map((id) => [id, { count: 0, sources: new Map() }]));
+  const add = (refs, source) => {
+    for (const ref of refs) {
+      const { id, rest } = gitflowBucket(ref.short || ref.name, rules);
+      const bucket = buckets.get(id);
+      bucket.count += 1;
+      if (!bucket.sources.has(source)) bucket.sources.set(source, []);
+      bucket.sources.get(source).push({
+        name: rest,
+        full: ref.name,
+        synced: Boolean(ref.synced),
+        remote: Boolean(ref.remote),
+      });
+    }
+  };
+  add(locals, "local");
+  const remoteNames = [...remotes.keys()].sort();
+  for (const name of remoteNames) add(remotes.get(name), name);
+  const rows = [];
+  for (const id of GITFLOW_ORDER) {
+    const bucket = buckets.get(id);
+    if (!bucket.count) continue;
+    const shut = folderShut(closed, id, reveal);
+    rows.push({ kind: "folder", path: id, name: KIND_LABEL[id] || id, depth: 0, shut, count: bucket.count, kindId: id });
+    if (shut) continue;
+    const sources = [...bucket.sources.entries()].sort(([a], [b]) =>
+      a === "local" ? -1 : b === "local" ? 1 : a.localeCompare(b),
+    );
+    for (const [source, items] of sources) {
+      const path = `${id}/${source}`;
+      const sourceShut = folderShut(closed, path, reveal);
+      rows.push({
+        kind: "folder",
+        path,
+        name: source,
+        depth: 1,
+        shut: sourceShut,
+        count: items.length,
+        remote: source !== "local",
+      });
+      if (!sourceShut) walkTree(branchTree(items), 2, path, closed, rows, reveal);
+    }
+  }
+  return rows;
 }
 
 export function localBranchNames(refs) {
@@ -151,24 +203,50 @@ export function branchRows(refs, closed = {}, options = {}) {
   if (query) {
     list = list.filter((ref) => matchesBranch(ref.name, query));
   }
-  const locals = [];
-  const remotes = new Map();
-  for (const ref of list) {
-    if (!ref.remote) {
-      locals.push(ref);
-      continue;
-    }
-    const parts = splitRemote(ref.name);
-    if (!parts) continue;
-    if (!remotes.has(parts.remote)) {
-      remotes.set(parts.remote, []);
-    }
-    remotes.get(parts.remote).push({ ...ref, short: parts.rest });
+  const { locals, remotes } = splitSources(list);
+  const sections = [];
+  sections.push({ id: "local", label: "LOCAL", rows: sectionRows(locals, "local", closed, rules, reveal) });
+  for (const name of [...remotes.keys()].sort()) {
+    sections.push({ id: name, label: name.toUpperCase(), rows: sectionRows(remotes.get(name), name, closed, rules, reveal) });
+  }
+  return sections;
+}
+
+function sectionRows(refs, name, closed, rules, reveal) {
+  if (!refs.length) return [];
+  const shut = folderShut(closed, name, reveal);
+  const rows = [];
+  if (rules.enabled) {
+    const gitflowRows = gitflowSubRows(refs, name, closed, rules, reveal);
+    rows.push(...gitflowRows);
+  } else {
+    const items = toItems(refs, (ref) => ref.short || ref.name);
+    const tree = branchTree(items);
+    walkTree(tree, 0, "", closed, rows, reveal);
+  }
+  return rows;
+}
+
+function gitflowSubRows(refs, parentPath, closed, rules, reveal) {
+  const buckets = new Map(GITFLOW_ORDER.map((id) => [id, []]));
+  for (const ref of refs) {
+    const fullName = ref.short || ref.name;
+    const { id, rest } = gitflowBucket(fullName, rules);
+    buckets.get(id).push({
+      name: rest,
+      full: ref.name,
+      synced: Boolean(ref.synced),
+      remote: Boolean(ref.remote),
+    });
   }
   const rows = [];
-  pushGroup(rows, "local", "local", locals, closed, rules, reveal);
-  for (const name of [...remotes.keys()].sort()) {
-    pushGroup(rows, name, name, remotes.get(name), closed, rules, reveal);
+  for (const id of GITFLOW_ORDER) {
+    const list = buckets.get(id);
+    if (!list.length) continue;
+    const path = `${parentPath}/${id}`;
+    const shut = folderShut(closed, path, reveal);
+    rows.push({ kind: "folder", path, name: KIND_LABEL[id] || id, depth: 0, shut, count: list.length, kindId: id });
+    if (!shut) walkTree(branchTree(list), 1, path, closed, rows, reveal);
   }
   return rows;
 }
