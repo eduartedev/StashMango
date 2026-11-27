@@ -217,10 +217,49 @@ fn create_branch(state: State<AppState>, name: String) -> Result<ops::RepoInfo, 
 }
 
 #[tauri::command]
+fn repo_log(state: State<AppState>, limit: Option<usize>) -> Result<String, String> {
+    let root = repo_path(&state)?;
+    ops::log_text(&state.git.bin, &root, limit.unwrap_or(300))
+}
+
+#[tauri::command]
+fn create_branch_at(state: State<AppState>, name: String, sha: String) -> Result<ops::RepoInfo, String> {
+    let root = repo_path(&state)?;
+    ops::create_branch_at(&state.git.bin, &root, &name, &sha)?;
+    ops::info(&state.git.bin, &root)
+}
+
+#[tauri::command]
 fn switch_branch(state: State<AppState>, name: String) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
     ops::switch_branch(&state.git.bin, &root, &name)?;
     ops::info(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn delete_branch(state: State<AppState>, name: String) -> Result<ops::RepoInfo, String> {
+    let root = repo_path(&state)?;
+    ops::delete_branch(&state.git.bin, &root, &name)?;
+    ops::info(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn create_tag(state: State<AppState>, name: String, message: Option<String>) -> Result<ops::RepoInfo, String> {
+    let root = repo_path(&state)?;
+    ops::create_tag(&state.git.bin, &root, &name, message.as_deref())?;
+    ops::info(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn resolve_ref(state: State<AppState>, name: String) -> Result<String, String> {
+    let root = repo_path(&state)?;
+    ops::resolve_ref(&state.git.bin, &root, &name)
+}
+
+#[tauri::command]
+fn branch_shas(state: State<AppState>) -> Result<Vec<(String, String)>, String> {
+    let root = repo_path(&state)?;
+    ops::branch_shas(&state.git.bin, &root)
 }
 
 #[tauri::command]
@@ -247,6 +286,12 @@ fn remove_worktree(state: State<AppState>, path: String, confirm: bool) -> Resul
 fn stash_list(state: State<AppState>) -> Result<Vec<String>, String> {
     let root = repo_path(&state)?;
     ops::stash_list(&state.git.bin, &root)
+}
+
+#[tauri::command]
+fn stash_refs(state: State<AppState>) -> Result<Vec<ops::StashRef>, String> {
+    let root = repo_path(&state)?;
+    ops::stash_refs(&state.git.bin, &root)
 }
 
 #[tauri::command]
@@ -590,11 +635,18 @@ pub fn run() {
             set_repo_skip_hooks,
             set_repo_hooks_dir,
             create_branch,
+            create_branch_at,
+            create_tag,
+            delete_branch,
+            resolve_ref,
+            branch_shas,
+            repo_log,
             switch_branch,
             worktrees,
             add_worktree,
             remove_worktree,
             stash_list,
+            stash_refs,
             stash_push,
             stash_apply,
             stash_pop,

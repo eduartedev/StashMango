@@ -77,6 +77,8 @@ pub struct Worktree {
     pub path: String,
     pub branch: String,
     pub head: String,
+    #[serde(default)]
+    pub dirty: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -340,6 +342,27 @@ fn push_xy(files: &mut Vec<FileState>, path: String, xy: &str) {
     files.push(file_state(path, staged, unstaged, false, false));
 }
 
+pub fn log_text(git: &Path, root: &Path, limit: usize) -> Result<String, String> {
+    let take = limit.clamp(1, 1000).to_string();
+    let out = gitrun::run_ok(
+        git,
+        root,
+        &[
+            "log",
+            "--exclude=refs/stash",
+            "--all",
+            "--date=iso-strict",
+            "--decorate=short",
+            "-n",
+            &take,
+            "--pretty=format:%h %ad %an <%ae> %d%n%s%n%b%x1e",
+        ],
+        &[],
+        None,
+    )?;
+    Ok(out.text().replace('\u{1e}', "\n\n"))
+}
+
 pub fn log_page(
     git: &Path,
     root: &Path,
@@ -354,6 +377,7 @@ pub fn log_page(
         &[
             "log",
             "--date-order",
+            "--exclude=refs/stash",
             "--all",
             "-n",
             &take,
@@ -1043,6 +1067,49 @@ pub fn create_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> 
     Ok(())
 }
 
+pub fn create_branch_at(git: &Path, root: &Path, name: &str, sha: &str) -> Result<(), String> {
+    check_branch(git, root, name)?;
+    check_sha(sha)?;
+    gitrun::run_ok(git, root, &["switch", "-c", name, sha], &[], None)?;
+    Ok(())
+}
+
+pub fn delete_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> {
+    gitrun::run_ok(git, root, &["branch", "-D", name], &[], None)?;
+    Ok(())
+}
+
+pub fn resolve_ref(git: &Path, root: &Path, name: &str) -> Result<String, String> {
+    let out = gitrun::run_ok(git, root, &["rev-parse", name], &[], None)?;
+    Ok(out.text().trim().to_string())
+}
+
+pub fn branch_shas(git: &Path, root: &Path) -> Result<Vec<(String, String)>, String> {
+    let out = gitrun::run_ok(git, root, &["branch", "--format=%(refname:short)%00%(objectname)"], &[], None)?;
+    let mut pairs = Vec::new();
+    for line in out.text().lines() {
+        let parts: Vec<&str> = line.split('\0').collect();
+        if parts.len() >= 2 {
+            let name = parts[0].to_string();
+            let sha = parts[1].to_string();
+            if !name.is_empty() && !sha.is_empty() {
+                pairs.push((name, sha));
+            }
+        }
+    }
+    Ok(pairs)
+}
+
+pub fn create_tag(git: &Path, root: &Path, name: &str, message: Option<&str>) -> Result<(), String> {
+    let args = if let Some(msg) = message {
+        vec!["tag", "-a", name, "-m", msg]
+    } else {
+        vec!["tag", name]
+    };
+    gitrun::run_ok(git, root, &args, &[], None)?;
+    Ok(())
+}
+
 pub fn switch_branch(git: &Path, root: &Path, name: &str) -> Result<(), String> {
     check_branch(git, root, name)?;
     let dirty = abort_if_busy(git, root)?;
@@ -1220,6 +1287,7 @@ pub fn worktrees(git: &Path, root: &Path) -> Result<Vec<Worktree>, String> {
         path: String::new(),
         branch: String::new(),
         head: String::new(),
+        dirty: 0,
     };
     for line in out.text().lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
@@ -1230,6 +1298,7 @@ pub fn worktrees(git: &Path, root: &Path) -> Result<Vec<Worktree>, String> {
                 path: path.to_string(),
                 branch: String::new(),
                 head: String::new(),
+                dirty: 0,
             };
         } else if let Some(head) = line.strip_prefix("HEAD ") {
             current.head = head.to_string();
@@ -1239,6 +1308,12 @@ pub fn worktrees(git: &Path, root: &Path) -> Result<Vec<Worktree>, String> {
     }
     if !current.path.is_empty() {
         list.push(current);
+    }
+    for tree in &mut list {
+        let dir = Path::new(&tree.path);
+        if dir.is_dir() {
+            tree.dirty = status(git, dir).map(|files| files.len()).unwrap_or(0);
+        }
     }
     Ok(list)
 }
@@ -1262,6 +1337,47 @@ pub fn remove_worktree(git: &Path, root: &Path, path: &Path, confirm: bool) -> R
 pub fn stash_list(git: &Path, root: &Path) -> Result<Vec<String>, String> {
     let out = gitrun::run_ok(git, root, &["stash", "list"], &[], None)?;
     Ok(out.text().lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StashRef {
+    pub id: String,
+    pub sha: String,
+    pub base: String,
+    pub label: String,
+}
+
+pub fn stash_refs(git: &Path, root: &Path) -> Result<Vec<StashRef>, String> {
+    let out = gitrun::run(
+        git,
+        root,
+        &["log", "-g", "refs/stash", "--format=%H%x1f%P%x1f%gd%x1f%gs"],
+        &[],
+        None,
+    )?;
+    if !out.ok() {
+        return Ok(Vec::new());
+    }
+    let mut list = Vec::new();
+    for line in out.text().lines() {
+        let mut fields = line.split('\u{1f}');
+        let (Some(sha), Some(parents), Some(id), Some(label)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let base = parents.split_whitespace().next().unwrap_or("").to_string();
+        if sha.trim().is_empty() || base.is_empty() {
+            continue;
+        }
+        list.push(StashRef {
+            id: id.trim().to_string(),
+            sha: sha.trim().to_string(),
+            base,
+            label: label.trim().to_string(),
+        });
+    }
+    Ok(list)
 }
 
 pub fn stash_push(git: &Path, root: &Path, message: &str) -> Result<(), String> {
