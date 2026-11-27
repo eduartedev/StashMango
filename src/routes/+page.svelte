@@ -1027,6 +1027,11 @@
       <path d="M5 3.4v9.2L12.6 8z" />
     {:else if name === "undo"}
       <path d="M3 6.4h7.4a3.4 3.4 0 0 1 0 6.8H7.4M5.4 3.8 3 6.4l2.4 2.6" />
+    {:else if name === "palette"}
+      <path d="M8 2.8a5.2 5.2 0 1 0 0 10.4c1.2 0 2.2-.4 2.2-1.3 0-.8-.8-1.2-1.6-1.2H7.8a1 1 0 0 1 0-2h2.2c1 0 1.8-.8 1.8-1.8S11 5 10 5H8.4" />
+      <circle cx="5" cy="5.5" r="0.9" fill="currentColor" />
+      <circle cx="8" cy="4" r="0.9" fill="currentColor" />
+      <circle cx="11" cy="5.5" r="0.9" fill="currentColor" />
     {/if}
   </svg>
 {/snippet}
