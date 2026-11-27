@@ -219,7 +219,7 @@
 
   function touchTab() {
     if (!info) return;
-    tabs = placeRepoTab(tabs, info, worktrees);
+    tabs = placeRepoTab(tabs, info, worktrees, preferences.autoGroupWorktrees);
     activePath = info.path;
   }
 

@@ -6,10 +6,10 @@ function familyPaths(path, worktrees) {
   return list.map((tree) => tree.path);
 }
 
-export function placeRepoTab(tabs, info, worktrees = []) {
+export function placeRepoTab(tabs, info, worktrees = [], autoGroup = true) {
   const path = info?.path || "";
   if (!path) return tabs || [];
-  const family = familyPaths(path, worktrees);
+  const family = autoGroup ? familyPaths(path, worktrees) : [];
   const id = worktreePathKey(family[0] || path);
   const nextTab = {
     id,

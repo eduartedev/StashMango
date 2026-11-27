@@ -34,6 +34,13 @@
   const tonesAlt = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#a1887f", "#80cbc4", "#f06292", "#ba68c8", "#4db6ac", "#7986cb"];
 
   let activeTones = $derived(preferences?.graphColorIndex === 1 ? tonesAlt : tones);
+  let hoverBranch = $state("");
+  let groupColors = $derived({
+    gray: "#8c7b66",
+    mango: "#f5b942",
+    teal: "#2ec8c0",
+    rose: "#e14b8c",
+  });
 
   function filterRefs(refs, visibility = "all") {
     if (!refs || visibility === "all") return refs;
@@ -194,6 +201,21 @@
     refMenu = null;
     if (name) onpick?.(name);
   }
+
+  function onBranchHover(branch) {
+    if (preferences?.highlightBranchRows) {
+      hoverBranch = branch;
+    }
+  }
+
+  function onBranchLeave() {
+    hoverBranch = "";
+  }
+
+  function isRowHighlighted(commit) {
+    if (!hoverBranch || !preferences?.highlightBranchRows) return false;
+    return commit.refs?.some((ref) => ref.label === hoverBranch || ref.name === hoverBranch);
+  }
 </script>
 
 <div class="graph" style:--cols={cols}>
@@ -243,6 +265,8 @@
             title={target ? `Cambiar a ${target}` : packed.shown.synced ? `${packed.shown.title} · origin/${packed.shown.label}` : packed.shown.title}
             onclick={target ? () => onpick?.(target) : packed.extra.length ? (event) => openRefs(event, refChips(commit.refs)) : undefined}
             oncontextmenu={(event) => { event.preventDefault(); onmenu?.(event, commit); }}
+            onmouseenter={() => onBranchHover(packed.shown.label)}
+            onmouseleave={onBranchLeave}
           >
             {#if isCurrentRef(packed.shown, current)}
               <svg class="mark" viewBox="0 0 16 16" aria-label="Estás aquí"><path d="M3.2 8.4 6.4 11.6 12.8 4.4" /></svg>
@@ -262,6 +286,15 @@
   </div>
   {/if}
   {#if fields.includes("graph")}
+  {#if preferences?.showTreeInGraph}
+  <div class="tree-view">
+    {#each rows as commit, index}
+      <div class="tree-row" style:padding-left="{index * 16 + 8}px">
+        <span class="tree-branch">{commit.summary}</span>
+      </div>
+    {/each}
+  </div>
+  {:else}
   <svg {width} height={height} role="img" aria-label="Grafo de commits">
     {#if rows.findIndex((commit) => commit.id === selected) >= 0}
       <rect x="0" y={rows.findIndex((commit) => commit.id === selected) * row} {width} height={row} fill="#2a1c0c" />
@@ -304,11 +337,18 @@
         {:else}
           <circle cx={x(commit.lane)} cy={y(index)} r={selected === commit.id ? 8 : 6} fill={tone(commit.lane)} stroke="#0a0908" stroke-width="2" />
         {/if}
-        <title>{commit.summary}</title>
+        {#if preferences?.showGhostBranch && hoverBranch && commit.refs?.some((ref) => ref.label === hoverBranch)}
+          <text x={x(commit.lane) + 15} y={y(index) - 8} font-size="10" fill={groupColors[preferences?.defaultGroupColor] || "#8c7b66"}>{hoverBranch}</text>
+        {/if}
+        {#if preferences?.showDescriptionInGraph === "always" && commit.description}
+          <text x={x(commit.lane) + 15} y={y(index) - 8} font-size="10" fill="#8c7b66">{commit.description}</text>
+        {/if}
+        <title>{preferences?.showDescriptionInGraph === "always" ? `${commit.summary}\n\n${commit.description || ""}` : commit.summary}</title>
       </g>
       {/if}
     {/each}
   </svg>
+  {/if}
   {/if}
   {#each ["message", "author", "date", "hash"].filter((id) => fields.includes(id) && (preferences ? (id === "message" ? preferences.showMessageInGraph : id === "author" ? preferences.showAuthorInGraph : id === "date" ? preferences.showDateInGraph : true) : true)) as id (id)}
     <div class="rows">
@@ -319,6 +359,7 @@
           class:selected={selected === commit.id}
           class:pending={commit.pending}
           class:stash={commit.stash}
+          class:highlighted={isRowHighlighted(commit)}
           style:--lane-color={commit.pending || commit.stash ? "#f5b942" : tone(commit.lane)}
           draggable={id === "message" && !commit.pending && !commit.stash}
           ondragstart={(event) => event.dataTransfer?.setData("text/plain", `commit:${commit.id}`)}
@@ -710,4 +751,24 @@
   .commit-row:hover, .refcell:hover { background: #14110d; }
   .commit-row.selected, .refcell.selected { background: #2a1c0c; }
   .commit-row.selected .summary, .commit-row.selected { color: #ffffff; }
+  .commit-row.highlighted {
+    background: color-mix(in srgb, var(--lane-color, #f5b942) 20%, transparent);
+    box-shadow: inset 2px 0 0 var(--lane-color, #f5b942);
+  }
+  .tree-view {
+    flex: 1;
+    overflow: auto;
+    padding: 12px;
+    background: #100e0b;
+  }
+  .tree-row {
+    padding: 4px 0;
+    color: #f4ede0;
+    font-size: 13px;
+    border-left: 2px solid #2a2218;
+    margin-left: 8px;
+  }
+  .tree-branch {
+    margin-left: 8px;
+  }
 </style>
