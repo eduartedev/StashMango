@@ -1,7 +1,8 @@
 <script>
   import { untrack } from "svelte";
   import { EditorView, basicSetup } from "codemirror";
-  import { EditorState } from "@codemirror/state";
+  import { EditorState, StateEffect, StateField } from "@codemirror/state";
+  import { Decoration, EditorView as EV } from "@codemirror/view";
   import { javascript } from "@codemirror/lang-javascript";
   import { rust } from "@codemirror/lang-rust";
   import { json } from "@codemirror/lang-json";
@@ -15,6 +16,16 @@
   let resultEl;
   let theirsEl;
   let views = [];
+  let oursScroll = $state(0);
+  let theirsScroll = $state(0);
+  let resultScroll = $state(0);
+
+  function syncScroll(source, target) {
+    const ratio = source / (source === oursScroll ? oursEl?.scrollHeight : source === theirsScroll ? theirsEl?.scrollHeight : resultEl?.scrollHeight || 1);
+    if (target === oursScroll) oursEl?.scrollTo({ top: ratio * (oursEl.scrollHeight || 1) });
+    if (target === theirsScroll) theirsEl?.scrollTo({ top: ratio * (theirsEl.scrollHeight || 1) });
+    if (target === resultScroll) resultEl?.scrollTo({ top: ratio * (resultEl.scrollHeight || 1) });
+  }
 
   function language() {
     if (path.endsWith(".rs")) return rust();
@@ -33,7 +44,67 @@
       ".cm-gutters": { background: "#1a140e", color: "#b7a48a", border: "none" },
       ".cm-activeLine": { background: "#2c2418" },
       ".cm-content": { caretColor: "#f5b942" },
+      ".cm-line.cm-add": { backgroundColor: "#1e3d20" },
+      ".cm-line.cm-del": { backgroundColor: "#3d1d16" },
     });
+  }
+
+  const setDiff = StateEffect.define();
+
+  const diffField = StateField.define({
+    create() { return Decoration.none; },
+    update(deco, tr) {
+      deco = deco.map(tr.changes);
+      for (const e of tr.effects) {
+        if (e.is(setDiff)) {
+          const decorations = [];
+          for (const [line, kind] of e.value.lines) {
+            decorations.push(
+              Decoration.line({ class: kind === "add" ? "cm-add" : "cm-del" }).range(line)
+            );
+          }
+          deco = Decoration.set(decorations, true);
+        }
+      }
+      return deco;
+    },
+    provide: (f) => EV.decorations.from(f),
+  });
+
+  function computeDiffLines(resultText, baseText) {
+    const resultLines = resultText.split("\n");
+    const baseLines = baseText.split("\n");
+    const lines = new Map();
+    let i = 0, j = 0;
+    
+    while (i < resultLines.length || j < baseLines.length) {
+      if (i < resultLines.length && j < baseLines.length && resultLines[i] === baseLines[j]) {
+        i++; j++;
+        continue;
+      }
+      
+      if (j < baseLines.length && (i >= resultLines.length || baseLines[j] === resultLines[i + 1] || baseLines[j] === resultLines[i + 2])) {
+        lines.set(i, "del");
+        j++;
+        continue;
+      }
+      
+      if (i < resultLines.length && (j >= baseLines.length || resultLines[i] === baseLines[j + 1] || resultLines[i] === baseLines[j + 2])) {
+        lines.set(i, "add");
+        i++;
+        continue;
+      }
+      
+      if (i < resultLines.length) {
+        lines.set(i, "add");
+        i++;
+      }
+      if (j < baseLines.length) {
+        j++;
+      }
+    }
+    
+    return lines;
   }
 
   function mount(node, text, editable) {
@@ -44,6 +115,7 @@
           basicSetup,
           language(),
           theme(),
+          diffField,
           EditorView.editable.of(editable),
           EditorState.readOnly.of(!editable),
           EditorView.lineWrapping,
@@ -52,6 +124,13 @@
                 if (update.docChanged) result = update.state.doc.toString();
               })]
             : []),
+          EditorView.domEventHandlers({
+            scroll: (event, view) => {
+              const el = view.scrollDOM;
+              if (el === oursEl) syncScroll(el.scrollTop, theirsScroll);
+              if (el === theirsEl) syncScroll(el.scrollTop, oursScroll);
+            },
+          }),
         ],
       }),
       parent: node,
@@ -70,21 +149,38 @@
     const start = untrack(() => result);
     views.forEach((view) => view.destroy());
     views = [];
-    if (oursNode) mount(oursNode, oursText, false);
+    if (oursNode) {
+      const view = mount(oursNode, oursText, false);
+      const diffLines = computeDiffLines(oursText, start);
+      view.dispatch({ effects: setDiff.of({ lines: diffLines }) });
+    }
     if (resultNode) mount(resultNode, start, true);
-    if (theirsNode) mount(theirsNode, theirsText, false);
+    if (theirsNode) {
+      const view = mount(theirsNode, theirsText, false);
+      const diffLines = computeDiffLines(theirsText, start);
+      view.dispatch({ effects: setDiff.of({ lines: diffLines }) });
+    }
     return () => views.forEach((view) => view.destroy());
   });
 </script>
 
 <div class="merge">
-  <section class="pane ours">
-    <header>
-      <span>Nuestro</span>
-      <button type="button" onclick={() => onours?.()}>Usar este</button>
-    </header>
-    <div class="cm" bind:this={oursEl}></div>
-  </section>
+  <div class="merge-top">
+    <section class="pane ours">
+      <header>
+        <span>Nuestro</span>
+        <button type="button" onclick={() => onours?.()}>Usar este</button>
+      </header>
+      <div class="cm" bind:this={oursEl}></div>
+    </section>
+    <section class="pane theirs">
+      <header>
+        <span>Suyo</span>
+        <button type="button" onclick={() => ontheirs?.()}>Usar este</button>
+      </header>
+      <div class="cm" bind:this={theirsEl}></div>
+    </section>
+  </div>
   <section class="pane result">
     <header>
       <span>Resultado</span>
@@ -92,22 +188,21 @@
     </header>
     <div class="cm" bind:this={resultEl}></div>
   </section>
-  <section class="pane theirs">
-    <header>
-      <span>Suyo</span>
-      <button type="button" onclick={() => ontheirs?.()}>Usar este</button>
-    </header>
-    <div class="cm" bind:this={theirsEl}></div>
-  </section>
 </div>
 
 <style>
   .merge {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1.2fr);
     gap: 10px;
     min-height: 0;
     height: 100%;
+  }
+  .merge-top {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+    min-height: 0;
   }
   .pane {
     display: flex;
@@ -152,8 +247,11 @@
   .cm :global(.cm-editor) { height: 100%; }
   @media (max-width: 1100px) {
     .merge {
+      grid-template-rows: minmax(180px, 1fr) minmax(220px, 1.2fr);
+    }
+    .merge-top {
       grid-template-columns: 1fr;
-      grid-template-rows: minmax(180px, 1fr) minmax(220px, 1.2fr) minmax(180px, 1fr);
+      grid-template-rows: minmax(180px, 1fr) minmax(180px, 1fr);
     }
   }
 </style>
