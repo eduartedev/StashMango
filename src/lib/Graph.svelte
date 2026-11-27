@@ -26,10 +26,28 @@
     repoPath = "",
     stashRefs = [],
     pendingConflicts = 0,
+    preferences = null,
   } = $props();
   let refMenu = $state(null);
   const row = 36;
   const tones = ["#f5b942", "#e8941a", "#2ec8c0", "#e14b8c", "#8fd14f", "#6eb0d6", "#c9a0e0", "#3eaa8c", "#e07a3d", "#7dcfb6"];
+  const tonesAlt = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#a1887f", "#80cbc4", "#f06292", "#ba68c8", "#4db6ac", "#7986cb"];
+
+  let activeTones = $derived(preferences?.graphColorIndex === 1 ? tonesAlt : tones);
+
+  function filterRefs(refs, visibility = "all") {
+    if (!refs || visibility === "all") return refs;
+    if (visibility === "none") return [];
+    return refs.filter((ref) => {
+      const label = ref.label || ref.name || "";
+      const isRemote = label.includes("/") || ref.type === "remote";
+      return visibility === "local" ? !isRemote : isRemote;
+    });
+  }
+
+  function tone(index) {
+    return activeTones[index % activeTones.length];
+  }
 
   let anchored = $derived(
     (worktrees || [])
@@ -123,10 +141,6 @@
     return index * row + row / 2;
   }
 
-  function tone(lane) {
-    return tones[lane % tones.length];
-  }
-
   function ago(time) {
     if (!time) return "";
     const days = Math.floor((Date.now() / 1000 - time) / 86400);
@@ -207,7 +221,8 @@
   {#if fields.includes("refs")}
   <div class="refcol">
     {#each rows as commit (commit.id)}
-      {@const packed = packRefs(refChips(commit.refs))}
+      {@const filteredRefs = preferences?.showBranchesInGraph ? filterRefs(commit.refs, preferences?.graphBranchVisibility) : []}
+      {@const packed = packRefs(refChips(filteredRefs))}
       <div class="refcell" class:selected={selected === commit.id} class:pending={commit.pending} class:stash={commit.stash} style:--lane-color={commit.pending || commit.stash ? "#f5b942" : tone(commit.lane)} role="presentation">
         {#if commit.stash}
           <span class="label stash" title={commit.summary}>
@@ -295,7 +310,7 @@
     {/each}
   </svg>
   {/if}
-  {#each ["message", "author", "date", "hash"].filter((id) => fields.includes(id)) as id (id)}
+  {#each ["message", "author", "date", "hash"].filter((id) => fields.includes(id) && (preferences ? (id === "message" ? preferences.showMessageInGraph : id === "author" ? preferences.showAuthorInGraph : id === "date" ? preferences.showDateInGraph : true) : true)) as id (id)}
     <div class="rows">
       {#each rows as commit (commit.id)}
         <button
@@ -311,9 +326,9 @@
           oncontextmenu={(event) => { event.preventDefault(); if (!commit.pending && !commit.stash) onmenu?.(event, commit); }}
         >
           {#if id === "message"}<span class="summary">{commit.summary}</span>
-          {:else if id === "author"}<span class="who">{commit.author}</span>
+          {:else if id === "author"}<span class="who">{preferences?.showAuthorInitials ? commit.author?.split(" ").map((n) => n[0]).join("") : commit.author}</span>
           {:else if id === "date"}<span class="ago">{ago(commit.time)}</span>
-          {:else}<span class="hash">{commit.pending || commit.stash ? "" : commit.id.slice(0, 7)}</span>
+          {:else}<span class="hash">{commit.pending || commit.stash || !preferences?.showShaInGraph ? "" : commit.id.slice(0, 7)}</span>
           {/if}
         </button>
       {/each}

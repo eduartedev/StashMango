@@ -1083,13 +1083,15 @@
   <header class="top-tertiary">
     <div class="dock">
       <span class="chip" title={info.branch || "HEAD"}>
-        <span class="chip-kicker">{@render icon("branch")} Rama</span>
+        {#if preferences.showToolbarLabels}
+          <span class="chip-kicker">{@render icon("branch")} Rama</span>
+        {/if}
         <span class="chip-name">{info.branch || "HEAD"}</span>
       </span>
       <span class="dock-rule" aria-hidden="true"></span>
-      <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")} Fetch</button>
-      <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")} Pull</button>
-      <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")} Push</button>
+      <button onclick={() => fail(() => call("network", { action: "fetch", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("fetch")}{#if preferences.showToolbarLabels} Fetch{/if}</button>
+      <button onclick={() => fail(() => call("network", { action: "pull", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("pull")}{#if preferences.showToolbarLabels} Pull{/if}</button>
+      <button class="primary" onclick={() => fail(() => call("network", { action: "push", passphrase: passphrase || null }).then(loadRepo))}>{@render icon("push")}{#if preferences.showToolbarLabels} Push{/if}</button>
     </div>
   </header>
   {/if}
@@ -1854,6 +1856,7 @@
             repoPath={info.path}
             {stashRefs}
             pendingConflicts={info.files.filter((file) => file.conflict).length}
+            {preferences}
           />
           {#if !done}<button onclick={more}>Más historial</button>{/if}
         {/if}
