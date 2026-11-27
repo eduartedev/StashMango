@@ -9,6 +9,80 @@ pub struct Recent {
     pub branch: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Preferences {
+    #[serde(default = "default_true")]
+    pub show_toolbar_labels: bool,
+    #[serde(default)]
+    pub show_author_initials: bool,
+    #[serde(default = "default_true")]
+    pub show_ghost_branch: bool,
+    #[serde(default = "default_true")]
+    pub highlight_branch_rows: bool,
+    #[serde(default = "default_true")]
+    pub auto_group_worktrees: bool,
+    #[serde(default = "default_true")]
+    pub show_spell_check: bool,
+    #[serde(default = "default_graph_branch_visibility")]
+    pub graph_branch_visibility: String,
+    #[serde(default = "default_true")]
+    pub show_branches_in_graph: bool,
+    #[serde(default = "default_true")]
+    pub show_tags_in_graph: bool,
+    #[serde(default = "default_true")]
+    pub show_author_in_graph: bool,
+    #[serde(default = "default_true")]
+    pub show_date_in_graph: bool,
+    #[serde(default = "default_true")]
+    pub show_message_in_graph: bool,
+    #[serde(default = "default_description_visibility")]
+    pub show_description_in_graph: String,
+    #[serde(default)]
+    pub show_sha_in_graph: bool,
+    #[serde(default)]
+    pub show_tree_in_graph: bool,
+    #[serde(default)]
+    pub graph_color_index: u32,
+    #[serde(default = "default_group_color")]
+    pub default_group_color: String,
+}
+
+fn default_graph_branch_visibility() -> String {
+    "all".into()
+}
+
+fn default_description_visibility() -> String {
+    "always".into()
+}
+
+fn default_group_color() -> String {
+    "gray".into()
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            show_toolbar_labels: true,
+            show_author_initials: false,
+            show_ghost_branch: true,
+            highlight_branch_rows: true,
+            auto_group_worktrees: true,
+            show_spell_check: true,
+            graph_branch_visibility: default_graph_branch_visibility(),
+            show_branches_in_graph: true,
+            show_tags_in_graph: true,
+            show_author_in_graph: true,
+            show_date_in_graph: true,
+            show_message_in_graph: true,
+            show_description_in_graph: default_description_visibility(),
+            show_sha_in_graph: false,
+            show_tree_in_graph: false,
+            graph_color_index: 0,
+            default_group_color: default_group_color(),
+        }
+    }
+}
+
 pub const DEFAULT_ID: &str = "default";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -371,4 +445,20 @@ pub fn profile_for(path: &Path) -> Result<Option<Profile>, String> {
         .profiles
         .into_iter()
         .find(|item| item.id == link.profile_id))
+}
+
+pub fn preferences() -> Result<Preferences, String> {
+    let path = data_dir().join("preferences.json");
+    if !path.exists() {
+        return Ok(Preferences::default());
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(serde_json::from_str(&text).unwrap_or_default())
+}
+
+pub fn save_preferences(prefs: &Preferences) -> Result<Preferences, String> {
+    let dir = ensure()?;
+    let json = serde_json::to_string_pretty(prefs).map_err(|e| e.to_string())?;
+    fs::write(dir.join("preferences.json"), json).map_err(|e| e.to_string())?;
+    Ok(prefs.clone())
 }

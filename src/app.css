@@ -501,6 +501,57 @@ button.brand:hover { border: none; color: var(--mango); background: #14110d; }
 }
 .settings-pane .plate { max-width: 760px; }
 .settings-pane .templates-plate { max-width: 980px; }
+.prefs-section {
+  padding: 20px 0;
+  border-bottom: 1px solid #2a2218;
+}
+.prefs-section:last-of-type { border-bottom: none; }
+.section-label {
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--mango-pale);
+}
+.pref-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  color: #f4ede0;
+}
+.pref-row label {
+  flex: 1;
+  font-size: 13px;
+  color: #e8e4dc;
+}
+.pref-row input[type="checkbox"] {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--mango);
+}
+.pref-row select {
+  flex: none;
+  min-width: 140px;
+  padding: 6px 10px;
+  background: #16110c;
+  border: 1px solid #3a2e22;
+  border-radius: 8px;
+  color: #f4ede0;
+  font-size: 13px;
+}
+.pref-row input[type="number"] {
+  flex: none;
+  width: 60px;
+  padding: 6px 10px;
+  background: #16110c;
+  border: 1px solid #3a2e22;
+  border-radius: 8px;
+  color: #f4ede0;
+  font-size: 13px;
+}
 .tpl-shell {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);

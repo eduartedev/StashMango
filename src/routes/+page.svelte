@@ -14,6 +14,7 @@
   import { clampColumn, graphColumnChoices, layoutPayload, normalizeColumns, toggleGraphColumn } from "$lib/columns.js";
   import { defaultTemplates, fillTemplate, insertToken, normalizeTemplates, sampleVars, templateKinds, templateTokens, templateVars, wrapToken } from "$lib/commitTemplates.js";
   import { settingsNav, settingsSectionOr } from "$lib/settingsNav.js";
+  import { defaultPreferences, normalizePreferences, branchVisibilityOptions, descriptionVisibilityOptions, groupColorOptions } from "$lib/preferences.js";
   import { emptyServiceSaved, emptyServiceTokens, gitHadTokenNotice, services, tokenPage } from "$lib/services.js";
   import { defaultRepoLive, gitHooksDoc } from "$lib/gitHooks.js";
   import { BUSY_DELAY_MS, ERROR_MS, NOTICE_MS } from "$lib/flash.js";
@@ -87,6 +88,7 @@
   let cloneUrl = $state("");
   let cloneDest = $state("");
   let profileForm = $state({ id: "default", label: "default", name: "", email: "" });
+  let preferences = $state(normalizePreferences());
   let serviceTokens = $state(emptyServiceTokens());
   let serviceSaved = $state(emptyServiceSaved());
 
@@ -95,6 +97,7 @@
       recents = await call("recents");
       columns = normalizeColumns(await call("layout"));
       templates = normalizeTemplates(await call("templates"));
+      preferences = normalizePreferences(await call("preferences"));
     } catch (err) {
       const text = String(err);
       if (!text.includes("invoke")) error = text;
@@ -1646,6 +1649,105 @@
                   <small>{item.hint}</small>
                 </label>
               {/each}
+            </div>
+          </article>
+        {:else if settingsSection === "apariencia"}
+          <article class="plate">
+            <div class="plate-head">
+              <h2>{@render icon("palette")} Apariencia</h2>
+              <p>Personaliza cómo se muestra el grafo y la interfaz.</p>
+            </div>
+            <div class="prefs-section">
+              <p class="section-label">Interfaz general</p>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showToolbarLabels} />
+                <span>Mostrar etiquetas en la barra de herramientas</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showAuthorInitials} />
+                <span>Mostrar iniciales del autor en lugar de avatares</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showGhostBranch} />
+                <span>Mostrar rama/etiqueta fantasma al hover en commits</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.highlightBranchRows} />
+                <span>Resaltar filas asociadas al hover en ramas</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.autoGroupWorktrees} />
+                <span>Agrupar automáticamente pestañas de worktrees</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showSpellCheck} />
+                <span>Habilitar corrección ortográfica</span>
+              </label>
+            </div>
+            <div class="prefs-section">
+              <p class="section-label">Grafo de commits</p>
+              <div class="pref-row">
+                <label>Visibilidad de ramas:</label>
+                <select bind:value={preferences.graphBranchVisibility}>
+                  {#each branchVisibilityOptions as opt}
+                    <option value={opt.id}>{opt.label}</option>
+                  {/each}
+                </select>
+              </div>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showBranchesInGraph} />
+                <span>Mostrar ramas en el grafo</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showTagsInGraph} />
+                <span>Mostrar etiquetas en el grafo</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showAuthorInGraph} />
+                <span>Mostrar autor en el grafo</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showDateInGraph} />
+                <span>Mostrar fecha en el grafo</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showMessageInGraph} />
+                <span>Mostrar mensaje en el grafo</span>
+              </label>
+              <div class="pref-row">
+                <label>Descripción en el grafo:</label>
+                <select bind:value={preferences.showDescriptionInGraph}>
+                  {#each descriptionVisibilityOptions as opt}
+                    <option value={opt.id}>{opt.label}</option>
+                  {/each}
+                </select>
+              </div>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showShaInGraph} />
+                <span>Mostrar SHA en el grafo</span>
+              </label>
+              <label class="pref-row">
+                <input type="checkbox" bind:checked={preferences.showTreeInGraph} />
+                <span>Mostrar árbol en el grafo</span>
+              </label>
+            </div>
+            <div class="prefs-section">
+              <p class="section-label">Colores</p>
+              <div class="pref-row">
+                <label>Índice de color del grafo:</label>
+                <input type="number" min="0" max="15" bind:value={preferences.graphColorIndex} />
+              </div>
+              <div class="pref-row">
+                <label>Color de grupos por defecto:</label>
+                <select bind:value={preferences.defaultGroupColor}>
+                  {#each groupColorOptions as opt}
+                    <option value={opt.id}>{opt.label}</option>
+                  {/each}
+                </select>
+              </div>
+            </div>
+            <div class="plate-actions">
+              <button class="primary" onclick={() => fail(async () => { await call("save_preferences", { preferences }); notice = "Preferencias guardadas."; })}>Guardar</button>
             </div>
           </article>
         {/if}

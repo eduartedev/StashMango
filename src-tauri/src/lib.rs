@@ -118,6 +118,16 @@ fn save_templates(templates: store::Templates) -> Result<store::Templates, Strin
 }
 
 #[tauri::command]
+fn preferences() -> Result<store::Preferences, String> {
+    store::preferences()
+}
+
+#[tauri::command]
+fn save_preferences(prefs: store::Preferences) -> Result<store::Preferences, String> {
+    store::save_preferences(&prefs)
+}
+
+#[tauri::command]
 fn refresh(state: State<AppState>) -> Result<ops::RepoInfo, String> {
     let root = repo_path(&state)?;
     let info = ops::info(&state.git.bin, &root)?;
@@ -622,6 +632,8 @@ pub fn run() {
             save_layout,
             templates,
             save_templates,
+            preferences,
+            save_preferences,
             refresh,
             log_page,
             diff_file,

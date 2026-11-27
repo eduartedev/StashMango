@@ -5,6 +5,7 @@ export const settingsNav = [
   { id: "plantillas", label: "Plantillas", icon: "template" },
   { id: "git", label: "Git", icon: "branch" },
   { id: "columnas", label: "Columnas", icon: "sliders" },
+  { id: "apariencia", label: "Apariencia", icon: "palette" },
 ];
 
 export function settingsSectionOr(id) {
