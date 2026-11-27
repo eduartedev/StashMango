@@ -15,7 +15,10 @@ export function refChips(refs) {
         const label = raw.slice(5).trim();
         return [{ kind: "tag", label, title: raw }];
       }
-      if (raw.includes("/")) return [{ kind: "remote", label: raw, title: raw }];
+      if (raw.includes("/")) {
+        const display = raw.startsWith("origin/") ? raw.slice("origin/".length) : raw;
+        return [{ kind: "remote", label: raw, display, title: raw }];
+      }
       return [{ kind: "local", label: raw, title: raw }];
     });
   return joinOrigin(chips);
