@@ -3,12 +3,14 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { listen } from "@tauri-apps/api/event";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { LogicalSize } from "@tauri-apps/api/window";
   import { call } from "$lib/api";
   import { captionToggleTarget } from "$lib/caption.js";
   import { nextSide, sideNav } from "$lib/sideNav.js";
   import { branchMenuItems, menuPosition } from "$lib/branchMenu.js";
+  import { refChips } from "$lib/refChips.js";
   import { branchRows, localBranchNames } from "$lib/branchList.js";
-  import { assertGitflow, defaultGitflow, gitflowKinds, normalizeGitflow } from "$lib/gitflow.js";
+  import { assertGitflow, defaultGitflow, gitflowCreateKinds, gitflowKinds, normalizeGitflow } from "$lib/gitflow.js";
   import { clampColumn, graphColumnChoices, layoutPayload, normalizeColumns, toggleGraphColumn } from "$lib/columns.js";
   import { defaultTemplates, fillTemplate, insertToken, normalizeTemplates, sampleVars, templateKinds, templateTokens, templateVars, wrapToken } from "$lib/commitTemplates.js";
   import { settingsNav, settingsSectionOr } from "$lib/settingsNav.js";
@@ -46,6 +48,7 @@
   let branchRefs = $state([]);
   let worktrees = $state([]);
   let stashes = $state([]);
+  let stashRefs = $state([]);
   let prs = $state([]);
   let selected = $state(null);
   let files = $state([]);
@@ -57,12 +60,18 @@
   let remote = $state("");
   let passphrase = $state("");
   let newBranch = $state("");
+  let branchInput;
+  let gitflowAction = $state(null);
   let prTitle = $state("");
   let prHead = $state("");
   let prBase = $state("main");
   let modal = $state(null);
   let dragMenu = $state(null);
   let branchMenu = $state(null);
+  let commitMenu = $state(null);
+  let branchFrom = $state("");
+  let logText = $state(null);
+  let logLoading = $state(false);
   let steps = $state([]);
   let sideView = $state("ramas");
   let columns = $state(normalizeColumns());
@@ -173,9 +182,14 @@
     repoLive = await call("repo_live");
     worktrees = await call("worktrees");
     stashes = await call("stash_list");
+    stashRefs = await call("stash_refs");
     profile = await call("active_profile");
     remote = await call("remote");
     profiles = await call("profiles");
+    const shas = await call("branch_shas");
+    if (shas && Array.isArray(shas)) {
+      branchToSha = new Map(shas);
+    }
     const stamp = branchStamp(branchRefs);
     const cached = path ? logCache.get(path) : null;
     if (shouldReloadLog(cached, stamp)) {
@@ -319,7 +333,16 @@
     selected = commit;
     conflict = null;
     diff = null;
-    files = await call("commit_files", { sha: commit.id });
+    files = commit.pending
+      ? commit.pendingCurrent === false
+        ? []
+        : (info?.files || []).map((file) => file.path)
+      : await call("commit_files", { sha: commit.id });
+  }
+
+  function previewWorkFile(path) {
+    const meta = (info?.files || []).find((file) => file.path === path);
+    return showPreview(path, { cached: Boolean(meta?.staged) && !meta?.unstaged });
   }
 
   async function showPreview(path, options = {}) {
@@ -405,11 +428,127 @@
   function openBranchMenu(event, branch, remote = false) {
     event.preventDefault();
     const current = branch === (info?.branch || "");
-    const place = menuPosition(event.clientX, event.clientY, 280, current ? 188 : 248, {
-      width: window.innerWidth,
-      height: window.innerHeight,
+    const items = branchMenuItems(current, branch, info?.branch || "").filter((item) => !(remote && item.id === "switch"));
+    const height = Math.min(600, 80 + items.length * 44);
+    const place = menuPosition(event.clientX, event.clientY, 280, height, {
+      width: document.documentElement.clientWidth,
+      height: document.documentElement.clientHeight,
     });
     branchMenu = { branch, current, remote, ...place };
+  }
+
+  function openCommitMenu(event, commit) {
+    event.preventDefault();
+    const items = commitMenuItems(commit);
+    const height = Math.min(600, 80 + items.length * 44);
+    const place = menuPosition(event.clientX, event.clientY, 300, height, {
+      width: document.documentElement.clientWidth,
+      height: document.documentElement.clientHeight,
+    });
+    commitMenu = { commit, ...place };
+  }
+
+  function commitMenuItems(commit) {
+    const items = [
+      { id: "copy-hash", label: "Copiar hash", icon: "copy" },
+      { id: "copy-msg", label: "Copiar mensaje", icon: "copy" },
+      { id: "branch", label: "Nueva rama aquí", icon: "plus" },
+      { id: "tag", label: "Crear etiqueta aquí", icon: "folder" },
+      { id: "cherry", label: "Cherry-pick", icon: "play" },
+      { id: "reset", label: "Reset hard aquí", icon: "undo", danger: true },
+    ];
+    const current = info?.branch || "";
+    const chips = refChips(commit?.refs);
+    const namesFromRefs = chips.filter((chip) => chip.kind === "local" && chip.label !== "HEAD").map((chip) => chip.label);
+    const namesFromMap = [...branchToSha.entries()].filter(([_, sha]) => sha === commit.id).map(([name]) => name);
+    const names = [...new Set([...namesFromRefs, ...namesFromMap])];
+    for (const name of names.slice(0, 3)) {
+      items.push({ id: `name:${name}`, label: `Copiar nombre · ${name}`, icon: "copy" });
+      if (name === current) continue;
+      items.push({ id: `switch:${name}`, label: `Cambiar a ${name}`, icon: "switch" });
+      items.push({ id: `merge:${name}`, label: `Merge ${name} en ${current || "actual"}`, icon: "merge" });
+      items.push({ id: `rebase:${name}`, label: `Rebase ${current || "actual"} sobre ${name}`, icon: "rebase" });
+      items.push({ id: `delete:${name}`, label: `Eliminar ${name}`, icon: "close", danger: true });
+    }
+    return items;
+  }
+
+  async function runCommitAction(id) {
+    const commit = commitMenu?.commit;
+    commitMenu = null;
+    if (!commit) return;
+    const sep = id.indexOf(":");
+    const action = sep < 0 ? id : id.slice(0, sep);
+    const arg = sep < 0 ? "" : id.slice(sep + 1);
+    if (action === "name") {
+      await navigator.clipboard.writeText(arg);
+      notice = `Copiado ${arg}`;
+      return;
+    }
+    if (action === "switch") {
+      fail(async () => {
+        await call("switch_branch", { name: arg });
+        await loadRepo();
+      });
+      return;
+    }
+    if (action === "merge") {
+      ask(`Merge de ${arg} en ${info?.branch}.`, () => runMerge(arg));
+      return;
+    }
+    if (action === "rebase") {
+      const text = fillTemplate(templates.rebase, workVars({ branch: arg })) || `Rebase de ${info?.branch} sobre ${arg}. Reescribe los commits de la rama actual.`;
+      ask(text, async () => {
+        await call("rebase_branch", { upstream: arg });
+        await loadRepo();
+      });
+      return;
+    }
+    if (action === "delete") {
+      ask(`Eliminar la rama ${arg}. Se perderá si no está en ningún remoto.`, async () => {
+        await call("delete_branch", { name: arg });
+        await loadRepo();
+      });
+      return;
+    }
+    if (action === "tag") {
+      await ask("Nombre de la etiqueta (ej: v1.0.0)", async (name) => {
+        if (!name.trim()) return;
+        await call("create_tag", { name: name.trim(), message: null });
+        await loadRepo();
+      });
+      return;
+    }
+    if (id === "copy-hash") {
+      await navigator.clipboard.writeText(commit.id);
+      notice = `Copiado ${commit.id.slice(0, 7)}`;
+      return;
+    }
+    if (id === "copy-msg") {
+      await navigator.clipboard.writeText(commit.summary || "");
+      notice = "Mensaje copiado";
+      return;
+    }
+    if (id === "branch") {
+      branchFrom = commit.id;
+      newBranch = "";
+      notice = `Nueva rama desde ${commit.id.slice(0, 7)}. Escribe el nombre y pulsa Crear.`;
+      requestAnimationFrame(() => branchInput?.focus());
+      return;
+    }
+    if (id === "cherry") {
+      await ask(`Cherry-pick de ${commit.id.slice(0, 7)} (${commit.summary}) en ${info?.branch || "la rama actual"}.`, async () => {
+        await call("cherry_pick", { sha: commit.id, message: "" });
+        await loadRepo();
+      });
+      return;
+    }
+    if (id === "reset") {
+      await ask(`Reset hard a ${commit.id.slice(0, 7)}. El trabajo sin commit se pierde. Puedes volver con «Volver».`, async () => {
+        await call("reset_hard", { target: commit.id, confirm: true });
+        await loadRepo();
+      });
+    }
   }
 
   async function copyBranchName(name) {
@@ -444,6 +583,17 @@
       const text = fillTemplate(templates.rebase, workVars({ branch })) || `Rebase de ${info.branch} sobre ${branch}. Reescribe los commits de la rama actual.`;
       ask(text, async () => {
         await call("rebase_branch", { upstream: branch });
+        await loadRepo();
+      });
+    } else if (id === "delete") {
+      ask(`Eliminar la rama ${branch}. Se perderá si no está en ningún remoto.`, async () => {
+        await call("delete_branch", { name: branch });
+        await loadRepo();
+      });
+    } else if (id === "tag") {
+      ask("Nombre de la etiqueta (ej: v1.0.0)", async (name) => {
+        if (!name.trim()) return;
+        await call("create_tag", { name: name.trim(), message: null });
         await loadRepo();
       });
     } else if (id === "fetch" || id === "pull" || id === "push") {
@@ -569,6 +719,62 @@
     closedFolders = { ...closedFolders, [path]: !shut };
   }
 
+  function pickKind(prefix) {
+    newBranch = prefix;
+    branchInput?.focus();
+  }
+
+  async function createBranch() {
+    const name = newBranch.trim();
+    if (!name) return;
+    if (branchFrom) {
+      await call("create_branch_at", { name, sha: branchFrom });
+      branchFrom = "";
+    } else {
+      await call("create_branch", { name });
+    }
+    newBranch = "";
+    await loadRepo();
+  }
+
+  async function openLog() {
+    logLoading = true;
+    try {
+      logText = await call("repo_log", { limit: 300 });
+    } catch (err) {
+      notice = String(err);
+    } finally {
+      logLoading = false;
+    }
+  }
+
+  function openGitflowPanel() {
+    gitflowAction = { kind: "panel" };
+  }
+
+  function closeGitflowPanel() {
+    gitflowAction = null;
+  }
+
+  async function gitflowStart(kind) {
+    const prefix = kind === "feature" ? "feature/" : kind === "release" ? "release/" : "hotfix/";
+    newBranch = prefix;
+    branchInput?.focus();
+    gitflowAction = null;
+  }
+
+  async function gitflowFinish(kind) {
+    const current = info?.branch || "";
+    if (!current) return;
+    const text = kind === "feature" ? `Terminar feature ${current}` : kind === "release" ? `Terminar release ${current}` : `Terminar hotfix ${current}`;
+    ask(text, async () => {
+      await call("switch_branch", { name: "develop" });
+      await call("merge", { branch: current, message: text });
+      await loadRepo();
+    });
+    gitflowAction = null;
+  }
+
   async function saveGitflow(patch = {}) {
     const flow = assertGitflow({ ...gitflow, ...patch });
     gitflow = normalizeGitflow(await call("set_repo_gitflow", { flow }));
@@ -576,7 +782,9 @@
   }
 
   let branches = $derived(localBranchNames(branchRefs));
-  let branchList = $derived(branchRows(branchRefs, closedFolders, { gitflow, query: branchQuery }));
+  let branchToSha = $state(new Map());
+  let branchSections = $derived(branchRows(branchRefs, closedFolders, { gitflow, query: branchQuery }));
+  let createKinds = $derived(gitflow.enabled ? gitflowCreateKinds(gitflow) : []);
   let stashList = $derived(stashRows(stashes));
 
   async function saveStash() {
@@ -812,6 +1020,10 @@
     {:else if name === "remote"}
       <path d="M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z" />
       <path d="M2.6 8h10.8M8 2.8c1.6 1.6 2.4 3.3 2.4 5.2s-.8 3.6-2.4 5.2c-1.6-1.6-2.4-3.3-2.4-5.2s.8-3.6 2.4-5.2" />
+    {:else if name === "play"}
+      <path d="M5 3.4v9.2L12.6 8z" />
+    {:else if name === "undo"}
+      <path d="M3 6.4h7.4a3.4 3.4 0 0 1 0 6.8H7.4M5.4 3.8 3 6.4l2.4 2.6" />
     {/if}
   </svg>
 {/snippet}
@@ -821,6 +1033,9 @@
   <header class="top" data-tauri-drag-region ondblclick={toggleFromCaption}>
     <button class="brand" onclick={goHome}>{@render mango(28)} StashMango</button>
     <span class="spacer" data-tauri-drag-region></span>
+    {#if screen === "repo"}
+      <button class="ghost" onclick={openLog} disabled={logLoading}>{logLoading ? "Cargando…" : "Historial"}</button>
+    {/if}
     <button class="ghost" onclick={openSettings}>{@render icon("sliders")} Configuración</button>
     <div class="win-controls">
       <button type="button" aria-label="Minimizar" onclick={minimizeWindow}>{@render icon("minus")}</button>
@@ -895,43 +1110,80 @@
       <div class="side-pane">
       <button type="button" class="splitter" aria-label="Ancho del panel" onpointerdown={(event) => dragColumn(event, "sideWidth")}></button>
       {#if sideView === "ramas"}
-      <div class="section">
-        <p class="kicker">Ramas</p>
-        <input class="branch-search" type="search" placeholder="Buscar rama" bind:value={branchQuery} autocomplete="off" spellcheck="false" />
-          {#if branchQuery.trim() && !branchList.length}
+      <div class="section branches">
+        <div class="branches-head">
+          <p class="kicker">Ramas</p>
+          <span class="branches-total muted">{branchRefs.length}</span>
+        </div>
+        <input class="branch-search" type="search" placeholder="Buscar rama" bind:value={branchQuery} autocomplete="off" spellcheck="false" aria-label="Buscar rama" />
+          {#if branchQuery.trim() && !branchSections.some((s) => s.rows.length)}
             <p class="muted">Ninguna rama con ese nombre.</p>
           {/if}
-          {#each branchList as row (row.kind + (row.path || row.branch))}
-            {#if row.kind === "folder"}
-              <button type="button" class="folder" class:shut={row.shut} style:padding-left={`${8 + row.depth * 12}px`} onclick={() => toggleFolder(row.path)}>
-                <span class="caret">{row.shut ? "▸" : "▾"}</span>
-                <span>{row.name}</span>
-                <span class="muted">{row.count}</span>
-              </button>
-            {:else}
-              <button
-                type="button"
-                class="branch"
-                class:current={row.branch === info.branch}
-                style:padding-left={`${8 + row.depth * 12}px`}
-                draggable="true"
-                ondragstart={(event) => event.dataTransfer?.setData("text/plain", `branch:${row.branch}`)}
-                ondragover={(event) => event.preventDefault()}
-                ondrop={(event) => { event.preventDefault(); dropOn(row.branch, event.dataTransfer?.getData("text/plain") || ""); }}
-                onclick={() => { if (row.remote) return; fail(async () => { await call("switch_branch", { name: row.branch }); await loadRepo(); }); }}
-                oncontextmenu={(event) => openBranchMenu(event, row.branch, row.remote)}
-                title={row.synced ? `Igual que origin/${row.branch}` : row.remote ? row.branch : undefined}
-              >
-                <span class="name">{row.label}</span>
-                {#if row.synced}
-                  <span class="sync">{@render icon("remote")}</span>
+          {#if !branchSections.some((s) => s.rows.length) && !branchQuery.trim()}
+            <p class="muted">No hay ramas.</p>
+          {/if}
+          {#each branchSections as section (section.id)}
+            {#if section.rows.length}
+              <div class="branch-section">
+                <button type="button" class="section-header" onclick={() => toggleFolder(section.id)}>
+                  <span class="caret">{closedFolders[section.id] !== false ? "▸" : "▾"}</span>
+                  <span class="section-label">{section.label}</span>
+                  <span class="muted">{section.rows.reduce((sum, row) => sum + (row.count || 1), 0)}</span>
+                </button>
+                {#if closedFolders[section.id] !== false}
+                {:else}
+                  {#each section.rows as row (row.kind + (row.path || row.branch))}
+                    {#if row.kind === "folder"}
+                      <button type="button" class="folder {row.kindId ? `gf-${row.kindId}` : ''}" class:shut={row.shut} style:padding-left={`${16 + row.depth * 12}px`} onclick={() => toggleFolder(row.path)}>
+                        <span class="caret">{row.shut ? "▸" : "▾"}</span>
+                        {#if row.kindId}<span class="kind-dot"></span>{/if}
+                        <span class="fname">{row.name}</span>
+                        {#if row.remote}<span class="remote-tag">{@render icon("remote")}</span>{/if}
+                        <span class="muted">{row.count}</span>
+                      </button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="branch"
+                        class:current={row.branch === info.branch}
+                        class:remote={row.remote}
+                        style:padding-left={`${16 + row.depth * 12}px`}
+                        draggable="true"
+                        ondragstart={(event) => event.dataTransfer?.setData("text/plain", `branch:${row.branch}`)}
+                        ondragover={(event) => event.preventDefault()}
+                        ondrop={(event) => { event.preventDefault(); dropOn(row.branch, event.dataTransfer?.getData("text/plain") || ""); }}
+                        onclick={() => { if (row.remote) return; fail(async () => { await call("switch_branch", { name: row.branch }); await loadRepo(); }); }}
+                        oncontextmenu={(event) => openBranchMenu(event, row.branch, row.remote)}
+                        title={row.synced ? `Igual que origin/${row.branch}` : row.remote ? row.branch : row.branch === info.branch ? "Rama actual" : row.branch}
+                      >
+                        <span class="name">{row.label}</span>
+                        {#if row.remote || row.synced}
+                          <span class="sync">{@render icon("remote")}</span>
+                        {/if}
+                      </button>
+                    {/if}
+                  {/each}
                 {/if}
-              </button>
+              </div>
             {/if}
           {/each}
-          <div class="rowish">
-            <input placeholder="nueva rama" bind:value={newBranch} />
-            <button onclick={() => fail(async () => { await call("create_branch", { name: newBranch }); newBranch = ""; await loadRepo(); })}>Crear</button>
+          <div class="branch-new">
+            {#if gitflow.enabled}
+              <button type="button" class="gitflow-toggle" onclick={openGitflowPanel}>
+                {@render icon("merge")} Gitflow
+              </button>
+            {/if}
+            {#if createKinds.length}
+              <div class="branch-kinds">
+                {#each createKinds as kind (kind.id)}
+                  <button type="button" class="kind" title={`Nueva rama ${kind.prefix}…`} onclick={() => pickKind(kind.prefix)}>{@render icon("plus")}{kind.label}</button>
+                {/each}
+              </div>
+            {/if}
+            <div class="rowish">
+              <input bind:this={branchInput} placeholder="nueva rama" bind:value={newBranch} onkeydown={(event) => { if (event.key === "Enter") fail(createBranch); }} aria-label="Nueva rama" />
+              <button disabled={!newBranch.trim()} onclick={() => fail(createBranch)}>Crear</button>
+            </div>
           </div>
       </div>
       {:else if sideView === "worktrees"}
@@ -1022,7 +1274,31 @@
       {/if}
       </div>
       {/if}
-      </div>
+      {#if gitflowAction && gitflowAction.kind === "panel"}
+        <div class="gitflow-panel-back" onclick={closeGitflowPanel}>
+          <div class="gitflow-panel" onclick={(event) => event.stopPropagation()}>
+            <div class="gitflow-panel-head">
+              <p class="kicker">Gitflow</p>
+              <button type="button" class="ghost" onclick={closeGitflowPanel}>{@render icon("close")}</button>
+            </div>
+            <div class="gitflow-panel-body">
+              <div class="gitflow-column">
+                <p class="gf-col-head">Start</p>
+                <button type="button" class="gf-btn" onclick={() => gitflowStart("feature")}>Feature</button>
+                <button type="button" class="gf-btn" onclick={() => gitflowStart("release")}>Release</button>
+                <button type="button" class="gf-btn" onclick={() => gitflowStart("hotfix")}>Hotfix</button>
+              </div>
+              <div class="gitflow-panel-vline"></div>
+              <div class="gitflow-column">
+                <p class="gf-col-head">Finish</p>
+                <button type="button" class="gf-btn" onclick={() => gitflowFinish("feature")}>Feature</button>
+                <button type="button" class="gf-btn" onclick={() => gitflowFinish("release")}>Release</button>
+                <button type="button" class="gf-btn" onclick={() => gitflowFinish("hotfix")}>Hotfix</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      {/if}
     </aside>
     {/if}
     <div class="stage">
@@ -1433,7 +1709,7 @@
                       {/if}
                     </header>
                     {#each hunk.lines as line, lineIndex}
-                      <div class="diff-line" class:add={lineKind(line) === "add"} class:del={lineKind(line) === "del"}>
+                      <div class="diff-line" class:add={lineKind(line) === "add"} class:del={lineKind(line) === "del"} class:ctx={lineKind(line) === "ctx"}>
                         {#if staging && stageableIndex(hunk.lines, lineIndex) >= 0}
                           <button
                             type="button"
@@ -1470,6 +1746,12 @@
             {branches}
             current={info.branch || ""}
             onpick={(name) => fail(async () => { await call("switch_branch", { name }); await loadRepo(); })}
+            onmenu={openCommitMenu}
+            pending={info.files.length}
+            {worktrees}
+            repoPath={info.path}
+            {stashRefs}
+            pendingConflicts={info.files.filter((file) => file.conflict).length}
           />
           {#if !done}<button onclick={more}>Más historial</button>{/if}
         {/if}
@@ -1503,7 +1785,7 @@
             <p class="work-empty">Sin cambios en el directorio de trabajo.</p>
           {/if}
           {#each groupWorkFiles(info.files) as group (group.id)}
-            <p class="work-kicker">{group.title} <span>{group.files.length}</span></p>
+            <p class="work-kicker" class:conflict={group.id === "conflict"}>{group.title} <span>{group.files.length}</span></p>
             <div class="work-list">
               {#each group.files as file (group.id + file.path)}
                 <div class="work-row" class:on={(!diff?.sha && diff?.path === file.path) || conflict?.path === file.path} class:conflict={file.conflict}>
@@ -1574,12 +1856,12 @@
             <h2>Commit</h2>
             <article class="commit-card">
               <h3 class="commit-title">{selected.summary}</h3>
-              <p class="muted commit-meta">{selected.author}{selected.refs ? ` · ${selected.refs}` : ""}</p>
+              <p class="muted commit-meta">{selected.pending ? (selected.pendingCurrent === false ? selected.pendingLabel : "directorio de trabajo") : `${selected.author}${selected.refs ? ` · ${selected.refs}` : ""}`}</p>
               {#if files.length}
                 <div class="work-list">
                   {#each files as file (file)}
-                    <div class="work-row solo" class:on={diff?.sha === selected.id && diff?.path === file}>
-                      <button type="button" class="work-file" title={file} onclick={() => fail(() => showPreview(file, { sha: selected.id }))}>
+                    <div class="work-row solo" class:on={diff?.path === file && (selected.pending ? !diff.sha : diff.sha === selected.id)}>
+                      <button type="button" class="work-file" title={file} onclick={() => fail(() => selected.pending ? previewWorkFile(file) : showPreview(file, { sha: selected.id }))}>
                         <span class="work-name">{fileName(file) || file}</span>
                         {#if fileFolder(file)}<span class="work-dir">{fileFolder(file)}</span>{/if}
                       </button>
@@ -1587,10 +1869,12 @@
                   {/each}
                 </div>
               {/if}
+              {#if !selected.pending}
               <div class="commit-actions">
                 <button type="button" class="danger" onclick={() => ask(`Reset hard a ${selected.id.slice(0, 7)}. El trabajo sin commit se pierde. Puedes volver al commit anterior en esta sesión.`, async () => { await call("reset_hard", { target: selected.id, confirm: true }); await loadRepo(); })}>Reset hard</button>
                 <button type="button" onclick={() => fail(async () => { await call("undo_reset"); await loadRepo(); })}>Volver</button>
               </div>
+              {/if}
             </article>
           </div>
         {/if}
@@ -1601,34 +1885,16 @@
     </div>
   </div>
 
-  {#if branchMenu}
-    <div
-      class="context-back"
-      role="presentation"
-      onclick={() => (branchMenu = null)}
-      oncontextmenu={(event) => { event.preventDefault(); branchMenu = null; }}
-      onkeydown={(event) => { if (event.key === "Escape") branchMenu = null; }}
-    >
-      <div
-        class="context"
-        role="menu"
-        tabindex="-1"
-        style:left={`${branchMenu.x}px`}
-        style:top={`${branchMenu.y}px`}
-        onclick={(event) => event.stopPropagation()}
-        onkeydown={(event) => { if (event.key === "Escape") branchMenu = null; }}
-      >
-        <p class="kicker">{branchMenu.current ? "Rama actual" : "Otra rama"}</p>
-        <p class="context-name">{branchMenu.branch}</p>
-        {#each branchMenuItems(branchMenu.current, branchMenu.branch, info?.branch || "").filter((item) => !(branchMenu.remote && item.id === "switch")) as item (item.id)}
-          <button type="button" role="menuitem" onclick={() => runBranchAction(item.id)}>
-            {@render icon(item.icon)}
-            <span class="menu-copy">
-              <span>{item.label}</span>
-              {#if item.flow}<small class="flow">{item.flow}</small>{/if}
-            </span>
-          </button>
-        {/each}
+  {#if logText !== null}
+    <div class="modal-back" role="presentation" onclick={() => (logText = null)}>
+      <div class="modal log-modal" role="dialog" aria-label="Historial git log" onclick={(event) => event.stopPropagation()}>
+        <p class="kicker">Historial</p>
+        <h2>git log</h2>
+        <pre class="log-text">{logText || "(sin commits)"}</pre>
+        <div class="actions">
+          <button onclick={() => (logText = null)}>Cerrar</button>
+          <button onclick={openLog} disabled={logLoading}>Actualizar</button>
+        </div>
       </div>
     </div>
   {/if}
@@ -1668,3 +1934,66 @@
     </div>
   {/if}
 </div>
+
+{#if branchMenu}
+  <div
+    class="context-back"
+    role="presentation"
+    onclick={() => (branchMenu = null)}
+    oncontextmenu={(event) => { event.preventDefault(); branchMenu = null; }}
+    onkeydown={(event) => { if (event.key === "Escape") branchMenu = null; }}
+  >
+    <div
+      class="context"
+      role="menu"
+      tabindex="-1"
+      style:left={`${branchMenu.x}px`}
+      style:top={`${branchMenu.y}px`}
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => { if (event.key === "Escape") branchMenu = null; }}
+    >
+      <p class="kicker">{branchMenu.current ? "Rama actual" : "Otra rama"}</p>
+      <p class="context-name">{branchMenu.branch}</p>
+      {#each branchMenuItems(branchMenu.current, branchMenu.branch, info?.branch || "").filter((item) => !(branchMenu.remote && item.id === "switch")) as item (item.id)}
+        <button type="button" role="menuitem" onclick={() => runBranchAction(item.id)}>
+          {@render icon(item.icon)}
+          <span class="menu-copy">
+            <span>{item.label}</span>
+            {#if item.flow}<small class="flow">{item.flow}</small>{/if}
+          </span>
+        </button>
+      {/each}
+    </div>
+  </div>
+{/if}
+
+{#if commitMenu}
+  <div
+    class="context-back"
+    role="presentation"
+    onclick={() => (commitMenu = null)}
+    oncontextmenu={(event) => { event.preventDefault(); commitMenu = null; }}
+    onkeydown={(event) => { if (event.key === "Escape") commitMenu = null; }}
+  >
+    <div
+      class="context"
+      role="menu"
+      tabindex="-1"
+      style:left={`${commitMenu.x}px`}
+      style:top={`${commitMenu.y}px`}
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => { if (event.key === "Escape") commitMenu = null; }}
+    >
+      <p class="kicker">Commit</p>
+      <p class="context-name">{commitMenu.commit.id.slice(0, 7)} · {commitMenu.commit.summary}</p>
+      {#each commitMenuItems(commitMenu.commit) as item (item.id)}
+        <button type="button" role="menuitem" class:danger={item.danger} onclick={() => runCommitAction(item.id)}>
+          {@render icon(item.icon)}
+          <span>{item.label}</span>
+        </button>
+      {/each}
+    </div>
+  </div>
+{/if}
+
+<svelte:body></svelte:body>
