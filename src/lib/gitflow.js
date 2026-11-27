@@ -64,6 +64,16 @@ function tokenMatches(name, token) {
   return name === token;
 }
 
+export function gitflowCreateKinds(flow) {
+  const config = normalizeGitflow(flow);
+  const kinds = [];
+  for (const kind of gitflowKinds) {
+    const prefix = parseGitflowTokens(config[kind.id]).find((token) => token.endsWith("/"));
+    if (prefix) kinds.push({ id: kind.id, label: kind.label, prefix });
+  }
+  return kinds;
+}
+
 export function gitflowBucket(short, rules = defaultGitflow()) {
   const name = String(short || "");
   const config = normalizeGitflow({ ...rules, enabled: true });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertGitflow, defaultGitflow, gitflowBucket, gitflowKinds, gitflowTokenOk, normalizeGitflow, parseGitflowTokens } from "./gitflow.js";
+import { assertGitflow, defaultGitflow, gitflowBucket, gitflowCreateKinds, gitflowKinds, gitflowTokenOk, normalizeGitflow, parseGitflowTokens } from "./gitflow.js";
 
 test("los valores por defecto son los de git flow", () => {
   const flow = defaultGitflow();
@@ -60,6 +60,30 @@ test("gitflowTokenOk acepta nombres y prefijos, no basura", () => {
   assert.equal(gitflowTokenOk("foo..bar"), false);
   assert.equal(gitflowTokenOk("rama mala"), false);
   assert.equal(gitflowTokenOk("main\nmaster"), false);
+});
+
+test("gitflowCreateKinds solo lista tipos con prefijo", () => {
+  const kinds = gitflowCreateKinds(defaultGitflow());
+  assert.deepEqual(
+    kinds.map((kind) => [kind.id, kind.prefix]),
+    [
+      ["feature", "feature/"],
+      ["release", "release/"],
+      ["hotfix", "hotfix/"],
+      ["support", "support/"],
+    ],
+  );
+  const custom = gitflowCreateKinds({ feature: "wip/, feat/", develop: "dev/" });
+  assert.deepEqual(
+    custom.map((kind) => [kind.id, kind.prefix]),
+    [
+      ["develop", "dev/"],
+      ["feature", "wip/"],
+      ["release", "release/"],
+      ["hotfix", "hotfix/"],
+      ["support", "support/"],
+    ],
+  );
 });
 
 test("assertGitflow rechaza un token inválido y deja pasar el resto", () => {
