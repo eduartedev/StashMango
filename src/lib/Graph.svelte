@@ -3,6 +3,7 @@
   import { graphFit, laneFits } from "$lib/graphFit.js";
   import { menuPosition } from "$lib/branchMenu.js";
   import { chipKind, isCurrentRef, packRefs, refChips, refTarget } from "$lib/refChips.js";
+  import { sameWorktreePath, worktreeLabel } from "$lib/worktreeCard.js";
 
   let {
     commits = [],
@@ -18,13 +19,100 @@
     branches = [],
     current = "",
     onpick,
+    onmenu,
     fields = ["refs", "graph", "message", "date"],
+    pending = 0,
+    worktrees = [],
+    repoPath = "",
+    stashRefs = [],
+    pendingConflicts = 0,
   } = $props();
   let refMenu = $state(null);
   const row = 36;
-  const tones = ["#2ec8c0", "#e14b8c", "#8fd14f", "#f0a05a", "#6eb0d6", "#c9a0e0", "#f5b942", "#3eaa8c", "#e07a3d", "#7dcfb6"];
+  const tones = ["#f5b942", "#e8941a", "#2ec8c0", "#e14b8c", "#8fd14f", "#6eb0d6", "#c9a0e0", "#3eaa8c", "#e07a3d", "#7dcfb6"];
 
-  let laneCount = $derived(commits.length ? Math.max(...commits.map((commit) => commit.lane)) + 1 : 0);
+  let anchored = $derived(
+    (worktrees || [])
+      .map((tree) => {
+        const isCurrent = sameWorktreePath(tree.path, repoPath);
+        const count = isCurrent ? pending : tree.dirty || 0;
+        if (!count) return null;
+        const head = commits.find((commit) => commit.id === tree.head) || (isCurrent ? commits[0] : null);
+        if (!head) return null;
+        const label = isCurrent ? current || "cambios" : worktreeLabel(tree) || "cambios";
+        return {
+          node: {
+            id: `__pending__${tree.path}`,
+            pending: true,
+            pendingCurrent: isCurrent,
+            pendingLabel: label,
+            pendingCount: count,
+            pendingPath: tree.path,
+            lane: head.lane,
+            parents: [head.id],
+            parent_lanes: [head.lane],
+            refs: "",
+            summary: isCurrent
+              ? `${count} cambio${count === 1 ? "" : "s"} sin commitear`
+              : `${label}: ${count} cambio${count === 1 ? "" : "s"} sin commitear`,
+            author: "",
+            time: 0,
+          },
+          head: head.id,
+        };
+      })
+      .filter(Boolean)
+  );
+
+  let commitLaneCount = $derived(commits.length ? Math.max(...commits.map((commit) => commit.lane)) + 1 : 1);
+
+  let stashAnchored = $derived(
+    (stashRefs || [])
+      .map((stash, index) => {
+        const base = commits.find((commit) => commit.id === stash.base);
+        if (!base) return null;
+        return {
+          node: {
+            id: `__stash__${stash.id}`,
+            stash: true,
+            stashId: stash.id,
+            lane: commitLaneCount + index,
+            parents: [base.id],
+            parent_lanes: [base.lane],
+            refs: "",
+            summary: stash.label || stash.id,
+            author: "",
+            time: 0,
+          },
+          head: base.id,
+        };
+      })
+      .filter(Boolean)
+  );
+
+  let rows = $derived.by(() => {
+    const pendingByHead = new Map();
+    for (const entry of anchored) {
+      const list = pendingByHead.get(entry.head) || [];
+      list.push(entry.node);
+      pendingByHead.set(entry.head, list);
+    }
+    const stashByHead = new Map();
+    for (const entry of stashAnchored) {
+      const list = stashByHead.get(entry.head) || [];
+      list.push(entry.node);
+      stashByHead.set(entry.head, list);
+    }
+    const out = [];
+    for (const commit of commits) {
+      for (const node of pendingByHead.get(commit.id) || []) out.push(node);
+      for (const node of stashByHead.get(commit.id) || []) out.push(node);
+      out.push(commit);
+    }
+    return out;
+  });
+
+  let laneCount = $derived(rows.length ? Math.max(...rows.map((commit) => commit.lane)) + 1 : 0);
   let fit = $derived(graphFit(laneCount, graphWidth));
 
   function x(lane) {
@@ -54,7 +142,7 @@
 
   function edge(x1, y1, x2, y2) {
     if (Math.abs(x1 - x2) < 1) return `M ${x1} ${y1} V ${y2}`;
-    const drop = Math.min(20, Math.abs(y2 - y1) / 2);
+    const drop = Math.min(30, Math.abs(y2 - y1) / 2.5);
     const yBend = y2 - Math.sign(y2 - y1) * drop;
     return `M ${x1} ${y1} V ${yBend} C ${x1} ${y2}, ${x2} ${yBend}, ${x2} ${y2}`;
   }
@@ -62,7 +150,7 @@
   let width = $derived(fit.width);
   let cols = $derived(columnTemplate(fields, refsWidth, width));
   const heads = { refs: "Ramas", graph: "Grafo", message: "Mensaje", author: "Autor", date: "Fecha", hash: "Hash" };
-  let height = $derived(Math.max(row, commits.length * row));
+  let height = $derived(Math.max(row, rows.length * row));
 
   function dragSize(event, name, start, notify) {
     const startX = event.clientX;
@@ -118,21 +206,33 @@
   <div class="body">
   {#if fields.includes("refs")}
   <div class="refcol">
-    {#each commits as commit (commit.id)}
+    {#each rows as commit (commit.id)}
       {@const packed = packRefs(refChips(commit.refs))}
-      <div class="refcell" class:selected={selected === commit.id} role="presentation">
-        {#if packed.shown}
+      <div class="refcell" class:selected={selected === commit.id} class:pending={commit.pending} class:stash={commit.stash} style:--lane-color={commit.pending || commit.stash ? "#f5b942" : tone(commit.lane)} role="presentation">
+        {#if commit.stash}
+          <span class="label stash" title={commit.summary}>
+            <span class="stash-dot"></span>
+            <span class="name">{commit.stashId}</span>
+          </span>
+        {:else if commit.pending}
+          <span class="label pending" class:alert={commit.pendingCurrent && pendingConflicts > 0} title="{commit.pendingCount} archivos sin commitear{commit.pendingCurrent && pendingConflicts ? ` · ${pendingConflicts} conflicto${pendingConflicts === 1 ? "" : "s"}` : ""}{commit.pendingCurrent ? "" : ` en ${commit.pendingPath}`}">
+            <span class="pending-dot"></span>
+            <span class="name">{commit.pendingLabel}</span>
+          </span>
+        {:else if packed.shown}
+          {@const target = isCurrentRef(packed.shown, current) ? "" : refTarget(packed.shown, branches)}
           <svelte:element
-            this={packed.extra.length ? "button" : "span"}
-            type={packed.extra.length ? "button" : undefined}
+            this={target || packed.extra.length ? "button" : "span"}
+            type={target || packed.extra.length ? "button" : undefined}
             class="label {packed.shown.kind}"
-            title={packed.shown.synced ? `${packed.shown.title} · origin/${packed.shown.label}` : packed.shown.title}
-            onclick={packed.extra.length ? (event) => openRefs(event, refChips(commit.refs)) : undefined}
+            title={target ? `Cambiar a ${target}` : packed.shown.synced ? `${packed.shown.title} · origin/${packed.shown.label}` : packed.shown.title}
+            onclick={target ? () => onpick?.(target) : packed.extra.length ? (event) => openRefs(event, refChips(commit.refs)) : undefined}
+            oncontextmenu={(event) => { event.preventDefault(); onmenu?.(event, commit); }}
           >
             {#if isCurrentRef(packed.shown, current)}
               <svg class="mark" viewBox="0 0 16 16" aria-label="Estás aquí"><path d="M3.2 8.4 6.4 11.6 12.8 4.4" /></svg>
             {/if}
-            <span class="name">{packed.shown.label}</span>
+            <span class="name">{packed.shown.display ?? packed.shown.label}</span>
             <span class="glyphs">
               {@render kindIcon(packed.shown.kind === "head" ? "local" : packed.shown.kind)}
               {#if packed.shown.synced}{@render kindIcon("remote")}{/if}
@@ -140,7 +240,7 @@
           </svelte:element>
         {/if}
         {#if packed.extra.length}
-          <button type="button" class="more" title="Ver etiquetas" onclick={(event) => openRefs(event, refChips(commit.refs))}>+{packed.extra.length}</button>
+          <button type="button" class="more" title="Ver etiquetas" onclick={(event) => openRefs(event, refChips(commit.refs))} oncontextmenu={(event) => { event.preventDefault(); onmenu?.(event, commit); }}>+{packed.extra.length}</button>
         {/if}
       </div>
     {/each}
@@ -148,44 +248,47 @@
   {/if}
   {#if fields.includes("graph")}
   <svg {width} height={height} role="img" aria-label="Grafo de commits">
-    {#if commits.findIndex((commit) => commit.id === selected) >= 0}
-      <rect x="0" y={commits.findIndex((commit) => commit.id === selected) * row} {width} height={row} fill="#2a1c0c" />
+    {#if rows.findIndex((commit) => commit.id === selected) >= 0}
+      <rect x="0" y={rows.findIndex((commit) => commit.id === selected) * row} {width} height={row} fill="#2a1c0c" />
     {/if}
-    <defs>
-      <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-        <feGaussianBlur stdDeviation="2.2" result="blur" />
-        <feMerge>
-          <feMergeNode in="blur" />
-          <feMergeNode in="SourceGraphic" />
-        </feMerge>
-      </filter>
-    </defs>
-    {#each commits as commit, index}
+    {#each rows as commit, index}
+      <rect x="0" y={index * row} {width} height={row} fill={commit.pending ? "#f5b942" : tone(commit.lane)} opacity={commit.pending ? "0.07" : "0.05"} />
+    {/each}
+    {#each rows as commit, index}
       {#each commit.parent_lanes as parentLane, parentIndex}
-        {@const parent = commits.findIndex((item) => item.id === commit.parents[parentIndex])}
+        {@const parent = rows.findIndex((item) => item.id === commit.parents[parentIndex])}
         {#if laneFits(commit.lane, fit) && laneFits(parentLane, fit)}
         <path
           d={edge(x(commit.lane), y(index), x(parentLane), parent >= 0 ? y(parent) : y(index) + row)}
-          stroke={tone(parentLane)}
-          stroke-width="2"
+          stroke={commit.stash ? "#f5b942" : tone(parentLane)}
+          stroke-width="3"
           stroke-linecap="round"
+          stroke-dasharray={commit.stash ? "8 5" : undefined}
           fill="none"
-          opacity="0.9"
+          opacity="1"
         />
         {/if}
       {/each}
     {/each}
-    {#each commits as commit, index}
+    {#each rows as commit, index}
       {#if laneFits(commit.lane, fit)}
       <g
         role="button"
         tabindex="0"
-        filter={selected === commit.id ? "url(#glow)" : undefined}
-        onclick={() => onselect(commit)}
-        onkeydown={(event) => event.key === "Enter" && onselect(commit)}
+        onclick={() => { if (!commit.stash && (!commit.pending || commit.pendingCurrent)) onselect(commit); }}
+        oncontextmenu={(event) => { event.preventDefault(); if (!commit.pending && !commit.stash) onmenu?.(event, commit); }}
+        onkeydown={(event) => event.key === "Enter" && !commit.stash && (!commit.pending || commit.pendingCurrent) && onselect(commit)}
       >
-        <circle cx={x(commit.lane)} cy={y(index)} r={selected === commit.id ? 7 : 5.5} fill="#100e0b" stroke={tone(commit.lane)} stroke-width="2" />
-        <circle cx={x(commit.lane)} cy={y(index)} r="2" fill={tone(commit.lane)} />
+        {#if selected === commit.id}
+          <circle cx={x(commit.lane)} cy={y(index)} r="10" fill={commit.pending ? "#f5b942" : tone(commit.lane)} opacity="0.25" />
+        {/if}
+        {#if commit.pending}
+          <rect x={x(commit.lane) - 6} y={y(index) - 6} width="12" height="12" rx="2.5" fill="#f5b942" stroke={commit.pendingCurrent && pendingConflicts ? "#e85d4c" : "#0a0908"} stroke-width="2" />
+        {:else if commit.stash}
+          <circle cx={x(commit.lane)} cy={y(index)} r="6" fill="#14110d" stroke="#f5b942" stroke-width="2.5" stroke-dasharray="3.5 2.5" />
+        {:else}
+          <circle cx={x(commit.lane)} cy={y(index)} r={selected === commit.id ? 8 : 6} fill={tone(commit.lane)} stroke="#0a0908" stroke-width="2" />
+        {/if}
         <title>{commit.summary}</title>
       </g>
       {/if}
@@ -194,19 +297,23 @@
   {/if}
   {#each ["message", "author", "date", "hash"].filter((id) => fields.includes(id)) as id (id)}
     <div class="rows">
-      {#each commits as commit (commit.id)}
+      {#each rows as commit (commit.id)}
         <button
           type="button"
           class="commit-row {id}"
           class:selected={selected === commit.id}
-          draggable={id === "message"}
+          class:pending={commit.pending}
+          class:stash={commit.stash}
+          style:--lane-color={commit.pending || commit.stash ? "#f5b942" : tone(commit.lane)}
+          draggable={id === "message" && !commit.pending && !commit.stash}
           ondragstart={(event) => event.dataTransfer?.setData("text/plain", `commit:${commit.id}`)}
-          onclick={() => onselect(commit)}
+          onclick={() => { if (!commit.stash && (!commit.pending || commit.pendingCurrent)) onselect(commit); }}
+          oncontextmenu={(event) => { event.preventDefault(); if (!commit.pending && !commit.stash) onmenu?.(event, commit); }}
         >
           {#if id === "message"}<span class="summary">{commit.summary}</span>
           {:else if id === "author"}<span class="who">{commit.author}</span>
           {:else if id === "date"}<span class="ago">{ago(commit.time)}</span>
-          {:else}<span class="hash">{commit.id.slice(0, 7)}</span>
+          {:else}<span class="hash">{commit.pending || commit.stash ? "" : commit.id.slice(0, 7)}</span>
           {/if}
         </button>
       {/each}
@@ -238,7 +345,7 @@
       {#each refMenu.chips as chip (chip.kind + chip.label)}
         <button type="button" role="menuitem" aria-label="{chipKind(chip.kind)} {chip.label}" disabled={!refTarget(chip, branches)} onclick={() => chooseRef(chip)}>
           <span class="kind {chip.kind}" title={chipKind(chip.kind)}>{@render kindIcon(chip.kind)}</span>
-          <span class="ref-name">{chip.label}</span>
+          <span class="ref-name">{chip.display ?? chip.label}</span>
           {#if chip.synced}
             <span class="kind remote sync" title="Igual que origin/{chip.label}">{@render kindIcon("remote")}</span>
           {/if}
@@ -339,11 +446,12 @@
     width: 100%;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
-    gap: 4px;
-    padding: 0 10px 0 8px;
+    justify-content: flex-start;
+    gap: 6px;
+    padding: 0 12px;
     overflow: hidden;
     min-width: 0;
+    background: color-mix(in srgb, var(--lane-color, transparent) 8%, transparent);
   }
   .label, .label:hover {
     display: inline-flex;
@@ -359,7 +467,7 @@
     border-radius: 0;
     box-shadow: none;
     background: transparent;
-    color: #e7e2d8;
+    color: var(--lane-color, #e7e2d8);
     font-size: 12.5px;
     font-weight: 650;
   }
@@ -370,8 +478,30 @@
     white-space: nowrap;
   }
   .label.tag { color: #b7d36a; }
-  .label.remote { color: #d7c4a4; }
-  .glyphs { display: inline-flex; align-items: center; gap: 3px; flex: none; color: #9a8b78; }
+  .label.pending {
+    color: #ffe7a3;
+    font-style: italic;
+  }
+  .pending-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #f5b942;
+    box-shadow: 0 0 6px #f5b942;
+  }
+  .commit-row.pending .summary { color: #ffe7a3; font-style: italic; }
+  .label.pending.alert .pending-dot { background: #e85d4c; box-shadow: 0 0 6px #e85d4c; }
+  .label.stash { color: #9fd8d0; font-style: italic; }
+  .stash-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.6px dashed #2ec8c0;
+  }
+  .commit-row.stash .summary { color: #9fd8d0; font-style: italic; }
+  .glyphs { display: inline-flex; align-items: center; gap: 3px; flex: none; color: color-mix(in srgb, var(--lane-color, #9a8b78) 65%, transparent); }
   .glyphs svg, .mark { width: 13px; height: 13px; display: block; }
   .glyphs svg path, .glyphs svg circle, .mark path {
     fill: none;
@@ -466,8 +596,15 @@
     border: 0;
     border-radius: 0;
     box-shadow: none;
-    background: transparent;
+    background: color-mix(in srgb, var(--lane-color, transparent) 8%, transparent);
     text-align: left;
+    color: #ffffff;
+  }
+  .commit-row:hover {
+    background: color-mix(in srgb, var(--lane-color, transparent) 12%, transparent);
+  }
+  .commit-row.selected {
+    background: color-mix(in srgb, var(--lane-color, transparent) 15%, transparent);
   }
   .summary {
     flex: 1;
@@ -478,11 +615,11 @@
     font-size: 13.5px;
     font-weight: 650;
     letter-spacing: -0.01em;
-    color: #f4f1ea;
+    color: #ffffff;
   }
   .ago {
     flex: none;
-    color: #8d8274;
+    color: #ffffff;
     font-size: 12px;
     font-weight: 500;
   }
@@ -550,12 +687,12 @@
     margin-left: auto;
     flex: none;
     font-family: "Fragment Mono", monospace;
-    color: #c4b09a;
+    color: #ffffff;
     letter-spacing: 0.02em;
   }
-  .commit-row.author, .commit-row.date, .commit-row.hash { color: #8c7b66; font-size: 12px; font-weight: 500; }
+  .commit-row.author, .commit-row.date, .commit-row.hash { color: #ffffff; font-size: 12px; font-weight: 500; }
   .commit-row.hash { font-family: "Fragment Mono", monospace; letter-spacing: 0.02em; }
   .commit-row:hover, .refcell:hover { background: #14110d; }
   .commit-row.selected, .refcell.selected { background: #2a1c0c; }
-  .commit-row.selected .summary, .commit-row.selected { color: #f4ede0; }
+  .commit-row.selected .summary, .commit-row.selected { color: #ffffff; }
 </style>
