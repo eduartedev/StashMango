@@ -32,8 +32,13 @@
   const row = 36;
   const tones = ["#f5b942", "#e8941a", "#2ec8c0", "#e14b8c", "#8fd14f", "#6eb0d6", "#c9a0e0", "#3eaa8c", "#e07a3d", "#7dcfb6"];
   const tonesAlt = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#a1887f", "#80cbc4", "#f06292", "#ba68c8", "#4db6ac", "#7986cb"];
+  const tonesVibrant = ["#ff6b6b", "#4ecdc4", "#45b7d1", "#96ceb4", "#ffeaa7", "#dfe6e9", "#fd79a8", "#6c5ce7", "#00b894", "#e17055"];
+  const tonesPastel = ["#fab1a0", "#74b9ff", "#55efc4", "#ffeaa7", "#a29bfe", "#fd79a8", "#81ecec", "#ff7675", "#74b9ff", "#dfe6e9"];
+  const tonesDark = ["#2d3436", "#636e72", "#b2bec3", "#dfe6e9", "#74b9ff", "#81ecec", "#55efc4", "#ffeaa7", "#fab1a0", "#ff7675"];
+  const tonesNeon = ["#00ff9f", "#00e5ff", "#ff00ff", "#ffff00", "#ff0099", "#00ff00", "#ff6600", "#6600ff", "#00ffff", "#ff3300"];
 
-  let activeTones = $derived(preferences?.graphColorIndex === 1 ? tonesAlt : tones);
+  const palettes = [tones, tonesAlt, tonesVibrant, tonesPastel, tonesDark, tonesNeon];
+  let activeTones = $derived(preferences?.graphColorIndex != null ? palettes[preferences.graphColorIndex % palettes.length] : tones);
   let hoverBranch = $state("");
   let groupColors = $derived({
     gray: "#8c7b66",
