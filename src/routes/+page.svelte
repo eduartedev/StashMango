@@ -1633,31 +1633,27 @@
               </div>
             {/if}
           </article>
-        {:else if settingsSection === "columnas"}
-          <article class="plate">
-            <div class="plate-head">
-              <h2>{@render icon("sliders")} Columnas</h2>
-              <p>Marca las que quieres ver en el grafo. Siempre queda al menos una.</p>
-            </div>
-            <div class="column-picks">
-              {#each graphColumnChoices as item (item.id)}
-                <label class="column-pick">
-                  <input
-                    type="checkbox"
-                    checked={columns.graphColumns.includes(item.id)}
-                    onchange={() => setGraphColumn(item.id)}
-                  />
-                  <strong>{item.label}</strong>
-                  <small>{item.hint}</small>
-                </label>
-              {/each}
-            </div>
-          </article>
         {:else if settingsSection === "apariencia"}
           <article class="plate">
             <div class="plate-head">
               <h2>{@render icon("palette")} Apariencia</h2>
               <p>Personaliza cómo se muestra el grafo y la interfaz.</p>
+            </div>
+            <div class="prefs-section">
+              <p class="section-label">Columnas del grafo</p>
+              <div class="column-picks">
+                {#each graphColumnChoices as item (item.id)}
+                  <label class="column-pick">
+                    <input
+                      type="checkbox"
+                      checked={columns.graphColumns.includes(item.id)}
+                      onchange={() => setGraphColumn(item.id)}
+                    />
+                    <strong>{item.label}</strong>
+                    <small>{item.hint}</small>
+                  </label>
+                {/each}
+              </div>
             </div>
             <div class="prefs-section">
               <p class="section-label">Interfaz general</p>

@@ -502,55 +502,111 @@ button.brand:hover { border: none; color: var(--mango); background: #14110d; }
 .settings-pane .plate { max-width: 760px; }
 .settings-pane .templates-plate { max-width: 980px; }
 .prefs-section {
-  padding: 20px 0;
+  padding: 24px 0;
   border-bottom: 1px solid #2a2218;
 }
 .prefs-section:last-of-type { border-bottom: none; }
 .section-label {
-  margin: 0 0 12px;
+  margin: 0 0 16px;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--mango-pale);
+  padding-bottom: 8px;
+  border-bottom: 2px solid var(--mango);
+  display: inline-block;
 }
 .pref-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 8px 0;
+  gap: 14px;
+  padding: 10px 0;
   color: #f4ede0;
+  border-bottom: 1px solid #2a2218;
 }
+.pref-row:last-child { border-bottom: none; }
 .pref-row label {
   flex: 1;
   font-size: 13px;
   color: #e8e4dc;
+  font-weight: 500;
 }
 .pref-row input[type="checkbox"] {
   flex: none;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   accent-color: var(--mango);
+  cursor: pointer;
 }
 .pref-row select {
   flex: none;
-  min-width: 140px;
-  padding: 6px 10px;
+  min-width: 160px;
+  padding: 8px 12px;
   background: #16110c;
   border: 1px solid #3a2e22;
-  border-radius: 8px;
+  border-radius: 10px;
   color: #f4ede0;
   font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.pref-row select:hover {
+  border-color: var(--mango);
 }
 .pref-row input[type="number"] {
   flex: none;
-  width: 60px;
-  padding: 6px 10px;
+  width: 70px;
+  padding: 8px 12px;
   background: #16110c;
   border: 1px solid #3a2e22;
-  border-radius: 8px;
+  border-radius: 10px;
   color: #f4ede0;
   font-size: 13px;
+  font-weight: 500;
+}
+.pref-row input[type="number"]:focus,
+.pref-row select:focus {
+  outline: none;
+  border-color: var(--mango);
+  box-shadow: 0 0 0 3px rgba(245, 185, 66, 0.1);
+}
+.column-picks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  padding: 12px 0;
+}
+.column-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  background: #16110c;
+  border: 1px solid #3a2e22;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.column-pick:hover {
+  border-color: var(--mango);
+  background: #1a140e;
+}
+.column-pick input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--mango);
+  cursor: pointer;
+}
+.column-pick strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: #f4ede0;
+}
+.column-pick small {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
 }
 .tpl-shell {
   display: grid;

@@ -4,7 +4,6 @@ export const settingsNav = [
   { id: "ssh", label: "Frase SSH", icon: "key" },
   { id: "plantillas", label: "Plantillas", icon: "template" },
   { id: "git", label: "Git", icon: "branch" },
-  { id: "columnas", label: "Columnas", icon: "sliders" },
   { id: "apariencia", label: "Apariencia", icon: "palette" },
 ];
 
